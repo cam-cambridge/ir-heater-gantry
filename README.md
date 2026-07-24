@@ -1,26 +1,188 @@
 # IR Heater Sequence Runner
 
-This project can run synchronized control steps for:
+Synchronized control of a **GRBL-based CNC gantry** and a **DPS5005 power supply**
+for automated IR heating experiments.  Includes dual-camera recording, visual
+pattern generation, and a manual alignment/jog interface.
 
-- A 3D printer (through `printrun` / `printcore`)
-- A DPS power supply (through Modbus using `dps_modbus.py`)
+## Hardware
 
-The runner reads one CSV that includes timing, electrical setpoints, and motion setpoints.
+- **GRBL controller** (Acmer laser cutter or any GRBL 1.1 gantry) via raw serial
+- **DPS5005** programmable DC supply via Modbus RTU (for the IR heater)
+- **Two USB cameras** (optional) for recording and alignment preview
 
-## CSV Format
+## Quick Start
 
-Required columns:
+```bash
+# Install dependencies
+uv sync
 
-- `time` (or `time_s`, `dt`, `duration`)
-- `current` (or `current_a`, `i`, `amps`)
-- `voltage` (or `voltage_v`, `v`, `volts`)
-- `x`
-- `y`
-- `z`
+# Launch the main sequence GUI
+uv run main.py gui
 
-Optional column:
+# Manual alignment with live camera preview
+uv run main.py align
 
-- `feedrate` (or `speed`, `f`)
+# Design heat-location grids visually
+uv run main.py pattern-gui
+```
+
+## Reproducibility
+
+Every run produces a **run metadata JSON** file (`run_metadata_<timestamp>.json`) in the
+output directory (or current directory for dry-runs).  It records:
+
+- Run ID, start/end timestamps (UTC), total duration
+- CSV file, loop count, time mode, feedrate
+- All hardware ports, baud rates, work-area limits
+- Camera IDs, FPS, recording file paths (`.mp4`)
+- Total steps vs. steps completed, any error message
+
+Camera recording runs in a **separate process** (`CameraRecorderProcess`) so that
+disk I/O from video encoding never blocks the timing-critical gcode loop.  The
+main sequence thread handles only GRBL serial, DPS Modbus, and sleep-based timing.
+
+## Project Structure
+
+```
+main.py                          # Unified CLI dispatcher
+pyproject.toml                   # Dependencies
+src/ir-heater/
+├── sequence_runner.py           # Core: CSV -> GRBL + DPS + cameras
+├── sequence_generator.py        # Old: A<->B oscillation generator
+├── pattern_generator.py         # Heat-location dwell-pattern generator (circle/rectangle/line)
+├── camera_controller.py         # Dual USB capture + process-isolated recording
+├── dps_modbus.py                # DPS5005 Modbus driver
+├── dps5005_limits.ini           # DPS voltage/current safety limits
+├── gui.py                       # Main sequence-runner GUI (PySide6)
+├── alignment_gui.py             # Manual jog + camera preview GUI (PySide6)
+├── pattern_utility_gui.py       # Grid/well-plate designer GUI (PySide6)
+└── gcodegenerator.py            # Standalone static G-code file writer
+```
+
+## CLI Commands
+
+### `run` — Execute a sequence
+
+```bash
+uv run main.py run \
+    --csv sequence.csv \
+    --modbus-port COM4 \
+    --grbl-port COM3 \
+    --loops 3 \
+    --cam0 0 --cam1 1 --cam-fps 15 --record-dir ./capture
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--csv` | *(required)* | Sequence CSV (see format below) |
+| `--loops` | `1` | Repeat the schedule N times |
+| `--time-mode` | `step` | `step` = per-row delay, `absolute` = cumulative |
+| `--default-feedrate` | `1200` | Fallback feedrate (mm/min) |
+| `--dry-run` | off | Parse & print without hardware |
+| `--modbus-port` | — | DPS serial port (COM4, /dev/ttyUSB0) |
+| `--modbus-address` | `1` | DPS Modbus address |
+| `--modbus-baud` | `9600` | DPS baud rate |
+| `--grbl-port` | — | GRBL serial port |
+| `--grbl-baud` | `115200` | GRBL baud rate |
+| `--x-max`, `--y-max`, `--z-max` | — | Software work-area clamps (mm) |
+| `--home-on-connect` | off | Run `$H` homing cycle on connect |
+| `--cam0`, `--cam1` | — | USB camera device IDs |
+| `--cam-fps` | `15` | Recording framerate |
+| `--record-dir` | — | Output directory for `.mp4` files and `run_metadata_*.json` |
+| `--return-to-first-position` | off | Return to first CSV position instead of origin |
+
+### `generate` — Old A<->B oscillation generator
+
+```bash
+uv run main.py generate \
+    --pairs-csv pair_specs.csv \
+    --output sequence.csv \
+    --default-transition-s 1.5
+```
+
+Input pairs CSV columns: `ax, ay, az, bx, by, bz, duration_s, current_a, voltage_v`
+
+Optional: `feedrate`, `transition_s` (time between pair sections).
+
+### `pattern-gen` — Heat-location dwell-pattern generator (circle / rectangle / line)
+
+```bash
+uv run main.py pattern-gen \
+    --locations heat_locations.csv \
+    --output sequence.csv \
+    --travel-feedrate 2000 \
+    --spiral-turns 3          # circle-shape only
+```
+
+Input locations CSV columns:
+
+| Column | Description |
+|---|---|
+| `x`, `y`, `z` | Centre of the heated region (mm) |
+| `dwell_time_s` | How long to dwell at this location |
+| `radius_mm` | Radius (circle), half-width (rect), or half-length (line) |
+| `dwell_feedrate` | Slow feedrate during dwell (mm/min) — separate from travel speed |
+| `voltage_v`, `current_a` | Heater setpoints |
+| `shape` *(optional)* | `circle` (default), `rectangle`, or `line` |
+| `width_mm` *(optional)* | Full width for rectangle; full length for line |
+| `height_mm` *(optional)* | Full height for rectangle (ignored for line) |
+| `label` *(optional)* | Human-readable name |
+
+Dwell patterns by shape:
+- **circle** — Archimedean spiral from centre → radius → back
+- **rectangle** — Zigzag raster fill of the rectangle area
+- **line** — Straight line traversed back and forth
+
+The output `sequence.csv` is directly compatible with `run`.
+
+### `gui` — Main sequence-runner window
+
+```bash
+uv run main.py gui
+```
+
+Load a pairs CSV, configure hardware, run sequences with live matplotlib plots
+and optional camera recording.  Writes `run_metadata_*.json` alongside
+recordings.
+
+### `align` — Manual alignment & jog window
+
+```bash
+uv run main.py align
+```
+
+- Live dual-camera preview (zero-copy `QImage` from OpenCV frames)
+- Jog pad: X+ / X- / Y+ / Y- / Z+ / Z- with configurable step size and feedrate
+- Go-to coordinate input
+- GRBL position polling (every 500 ms)
+- Heater ON/OFF toggle with voltage/current spinboxes
+- Save named positions and export to CSV
+
+### `pattern-gui` — Visual grid designer
+
+```bash
+uv run main.py pattern-gui
+```
+
+- Define rectangular grids (well plates) with rows x cols + spacing
+- Add multiple grids with different origins and colors
+- Add individual custom points
+- Zoomable/pannable preview (`QGraphicsView`)
+- Export to `heat_locations.csv` for use with `pattern-gen`
+
+## Sequence CSV Format
+
+Required columns (flexible aliases supported):
+
+| Column | Aliases |
+|---|---|
+| `time` | `time_s`, `dt`, `duration` |
+| `current` | `current_a`, `i`, `amps` |
+| `voltage` | `voltage_v`, `v`, `volts` |
+| `x` | — |
+| `y` | — |
+| `z` | — |
+| `feedrate` *(optional)* | `speed`, `f` |
 
 Example:
 
@@ -31,93 +193,24 @@ time,current,voltage,x,y,z,feedrate
 1.0,1.0,10.0,20,20,1,1200
 ```
 
-## Main Entrypoint
+## Dependencies
 
-`main.py` now acts as the unified CLI entrypoint.
-
-Supported modes:
-
-- `run` to execute a sequence CSV on the printer and DPS
-- `generate` to build a sequence CSV from position-pair definitions
-- no subcommand, which defaults to `run` for backward compatibility
-
-## Run
-
-Explicit run mode:
-
-```bash
-uv run main.py \
-	run \
-	--csv schedule.csv \
-	--modbus-port COM4 \
-	--printer-port COM6 \
-	--loops 3
+```
+matplotlib>=3.10.9     # Plotting
+minimalmodbus>=2.1.1   # DPS5005 Modbus
+opencv-python>=4.10    # Camera capture
+pyserial>=3.5          # Serial (GRBL)
+pyside6>=6.7           # Qt GUI framework
+pillow>=12.1.1         # Image support
 ```
 
-Backward-compatible form:
+## GRBL Notes
 
-```bash
-uv run main.py \
-	--csv schedule.csv \
-	--modbus-port COM4 \
-	--printer-port COM6 \
-	--loops 3
-```
-
-Important options:
-
-- `--time-mode step|absolute`
-- `--dry-run` to validate the CSV and print planned steps without sending hardware commands
-- `--default-feedrate 1200`
-
-## Loop Helper
-
-`--loops N` repeats your CSV sequence N times, similar to loop generation behavior in `gcodegenerator.py`.
-## Sequence Generator
-
-Use `main.py generate` to create schedule CSV files that are directly compatible with `read_sequence_csv` in `sequence_runner.py`.
-
-Run:
-
-```bash
-uv run main.py generate \
-	--pairs-csv pair_specs.csv \
-	--default-transition-s 1.5 \
-	--output sequence.csv
-```
-
-Input pairs CSV required columns:
-
-- `ax, ay, az`
-- `bx, by, bz`
-- `duration_s`
-- `current_a`
-- `voltage_v`
-
-Optional pair column:
-
-- `feedrate` (or `speed`, `f`) — defaults to `--default-feedrate` if omitted
-- `transition_s` (or `transition_to_next_s`, `move_to_next_s`) — time in seconds to move from this pair section to the next pair's `A` point
-
-Behavior:
-
-- For each pair row, the generator computes the exact travel time between A and B from geometry and feedrate:
-
-  $t_{travel} = \dfrac{\sqrt{\Delta x^2 + \Delta y^2 + \Delta z^2} \times 60}{feedrate}$
-
-  where feedrate is in mm/min (standard G-code).
-- Each CSV `time` value is set to exactly $t_{travel}$, so the runner sleeps for precisely as long as the printer needs to complete each move — no idle waiting, no queued-up commands mid-move.
-- The generator alternates A → B → A → B until the pair's `duration_s` is consumed, then moves to the next pair row.
-- Between pair sections, the generator inserts a transition move from the previous section's last reached point to the next section's `A` point.
-- That transition uses the specified `transition_s` (or `--default-transition-s`), and the transition feedrate is computed so the move takes exactly that time.
-- Each pair can have different `duration_s`, `current_a`, `voltage_v`, and `feedrate`.
-- A and B must not be the same position (zero distance produces an error).
-- Output CSV columns are: `time,current,voltage,x,y,z,feedrate`.
-
-Example input (`pair_specs.csv`):
-
-```csv
-ax,ay,az,bx,by,bz,duration_s,current_a,voltage_v,feedrate,transition_s
-10,10,1,20,10,1,15,1.20,12.0,1200,2.0
-20,20,1,30,20,1,8,0.90,10.5,1000,1.0
-```
+- Default baud rate is **115200** (not 250000 like Marlin)
+- The GRBL controller must be in **absolute mode (G90)** and **mm units (G21)**
+- Soft limits can be set on the controller (`$130`-`$132`) or passed as
+  `--x-max` / `--y-max` / `--z-max` CLI flags
+- The laser is **not** used — only the motion system. No `M3`/`M4`/`M5` commands
+  are sent
+- Homing: use `$H` via `--home-on-connect` or the Home button in the
+  alignment GUI

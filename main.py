@@ -41,6 +41,25 @@ def _run_gui() -> None:
     module.main()
 
 
+def _run_align() -> None:
+    module_path = Path(__file__).parent / "src" / "ir-heater" / "alignment_gui.py"
+    module = _load_module("alignment_gui", module_path)
+    module.main()
+
+
+def _run_pattern_generator(args: list[str]) -> None:
+    module_path = Path(__file__).parent / "src" / "ir-heater" / "pattern_generator.py"
+    module = _load_module("pattern_generator", module_path)
+    sys.argv = [sys.argv[0], *args]
+    module.main()
+
+
+def _run_pattern_gui() -> None:
+    module_path = Path(__file__).parent / "src" / "ir-heater" / "pattern_utility_gui.py"
+    module = _load_module("pattern_utility_gui", module_path)
+    module.main()
+
+
 def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "generate":
@@ -51,6 +70,15 @@ def main() -> None:
         return
     if args and args[0] == "gui":
         _run_gui()
+        return
+    if args and args[0] == "align":
+        _run_align()
+        return
+    if args and args[0] == "pattern-gen":
+        _run_pattern_generator(args[1:])
+        return
+    if args and args[0] == "pattern-gui":
+        _run_pattern_gui()
         return
 
     # Backward-compatible default: route directly to runner flags.

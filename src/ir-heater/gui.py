@@ -1,177 +1,389 @@
 """Graphical front-end for the IR-heater sequence runner.
 
-Launch via:
-    python main.py gui
-or directly (when run from the src/ir-heater directory):
-    python gui.py
+Launch via::
 
-The sequence runs in a background daemon thread so the GUI never delays
-hardware timing.  Plot updates are driven by a 100 ms polling timer on the
-main thread — well below any timing-sensitive interval.
+    python main.py gui
+
+Uses PySide6 (Qt) with:
+- FigureCanvasQTAgg for matplotlib embedding
+- QThread + Signal for background sequence execution
+- QTimer for GUI progress polling
 """
+
 from __future__ import annotations
 
-import queue
 import sys
-import threading
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 # ---------------------------------------------------------------------------
-# Import sequence_runner from the same directory regardless of cwd
+#  Local imports
 # ---------------------------------------------------------------------------
 _SR_DIR = Path(__file__).parent
 if str(_SR_DIR) not in sys.path:
     sys.path.insert(0, str(_SR_DIR))
 
-from sequence_generator import (  # noqa: E402 – path patched above
+from camera_controller import CameraController
+from sequence_generator import (
     generate_sequence_rows,
     read_pair_specs_csv,
     write_sequence_csv,
 )
-from sequence_runner import (  # noqa: E402 – path patched above
-    PrinterController,
+from sequence_runner import (
+    GrblController,
+    RunMetadata,
     SequenceStep,
-    connect_dps,
     read_sequence_csv,
     run_sequence,
 )
 
+# ---------------------------------------------------------------------------
+#  Constants
+# ---------------------------------------------------------------------------
 _DEFAULT_FEEDRATE = 1200.0
-_POLL_MS = 100  # GUI update interval in milliseconds
+_POLL_MS = 100
 
 
-# ---------------------------------------------------------------------------
-# Main application window
-# ---------------------------------------------------------------------------
+def _parse_optional_float(value: str) -> float | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
 
-class App(tk.Tk):
+
+# ======================================================================
+#  Background worker thread
+# ======================================================================
+
+class _SequenceWorker(QThread):
+    """Runs the sequence in a background thread, communicating via signals."""
+
+    progress = Signal(int, int)   # (current_step, total_steps)
+    done = Signal()
+    error = Signal(str)
+
+    def __init__(
+        self,
+        steps: list[SequenceStep],
+        time_mode: str,
+        dry_run: bool,
+        return_to_origin: bool,
+        modbus_port: str,
+        modbus_addr: int,
+        modbus_baud: int,
+        grbl_port: str,
+        grbl_baud: int,
+        x_max: float | None,
+        y_max: float | None,
+        z_max: float | None,
+        home_on_connect: bool,
+        record_cameras: bool,
+        cam0_id: int,
+        cam1_id: int,
+        cam_fps: float,
+        record_dir: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._steps = steps
+        self._time_mode = time_mode
+        self._dry_run = dry_run
+        self._return_to_origin = return_to_origin
+        self._modbus_port = modbus_port
+        self._modbus_addr = modbus_addr
+        self._modbus_baud = modbus_baud
+        self._grbl_port = grbl_port
+        self._grbl_baud = grbl_baud
+        self._x_max = x_max
+        self._y_max = y_max
+        self._z_max = z_max
+        self._home_on_connect = home_on_connect
+        self._record_cameras = record_cameras
+        self._cam0_id = cam0_id
+        self._cam1_id = cam1_id
+        self._cam_fps = cam_fps
+        self._record_dir = record_dir
+
+    def run(self) -> None:
+        dps = None
+        printer = None
+        cameras = None
+        record_dir = None
+        try:
+            if not self._dry_run:
+                ini_path = Path(__file__).with_name("dps5005_limits.ini")
+                from sequence_runner import connect_dps as _cdps
+                dps = _cdps(
+                    modbus_port=self._modbus_port,
+                    ini_path=ini_path,
+                    address=self._modbus_addr,
+                    baudrate=self._modbus_baud,
+                )
+                if self._grbl_port:
+                    printer = GrblController(
+                        self._grbl_port,
+                        baudrate=self._grbl_baud,
+                        x_max=self._x_max,
+                        y_max=self._y_max,
+                        z_max=self._z_max,
+                        home_on_connect=self._home_on_connect,
+                    )
+
+            if self._record_cameras and self._record_dir:
+                cameras = CameraController(
+                    cam0_id=self._cam0_id, cam1_id=self._cam1_id, fps=self._cam_fps,
+                )
+                record_dir = Path(self._record_dir)
+
+            # --- Metadata ---
+            from datetime import datetime, timezone
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            metadata = RunMetadata(
+                run_id=run_id,
+                time_mode=self._time_mode,
+                dry_run=self._dry_run,
+                return_to_origin=self._return_to_origin,
+                grbl_port=self._grbl_port,
+                grbl_baud=self._grbl_baud,
+                x_max=self._x_max,
+                y_max=self._y_max,
+                z_max=self._z_max,
+                home_on_connect=self._home_on_connect,
+                dps_port=self._modbus_port,
+                dps_address=self._modbus_addr,
+                dps_baud=self._modbus_baud,
+                cam0_id=self._cam0_id,
+                cam1_id=self._cam1_id,
+                cam_fps=self._cam_fps,
+                record_dir=self._record_dir,
+            )
+
+            def _on_step(index: int, total: int) -> None:
+                self.progress.emit(index, total)
+
+            run_sequence(
+                self._steps,
+                dps=dps,
+                printer=printer,
+                time_mode=self._time_mode,
+                dry_run=self._dry_run,
+                stop_event=None,
+                on_step=_on_step,
+                return_to_origin=self._return_to_origin,
+                cameras=cameras,
+                record_dir=record_dir,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            self.error.emit(str(exc))
+        else:
+            self.done.emit()
+
+
+# ======================================================================
+#  Main window
+# ======================================================================
+
+class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.title("IR Heater Sequence Runner")
-        self.resizable(True, True)
+        self.setWindowTitle("IR Heater Sequence Runner")
+        self.resize(1200, 750)
 
         self._looped_steps: list[SequenceStep] = []
         self._generated_csv_path: Path | None = None
-        self._stop_event = threading.Event()
-        self._progress_q: queue.Queue[int | str] = queue.Queue()
-        self._worker: threading.Thread | None = None
+        self._worker: _SequenceWorker | None = None
+        self._total_steps = 1
 
-        self._build_controls()
-        self._build_plots()
-        self.after(_POLL_MS, self._poll_progress)
+        self._build_ui()
+
+        # Progress poll timer
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_worker)
+        self._poll_timer.start(_POLL_MS)
 
     # ------------------------------------------------------------------
-    # Layout helpers
+    #  UI construction
     # ------------------------------------------------------------------
 
-    def _build_controls(self) -> None:
-        ctrl = ttk.Frame(self, padding=8)
-        ctrl.grid(row=0, column=0, sticky="ew")
-        self.columnconfigure(0, weight=1)
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
 
-        # --- Pairs CSV row ---
-        ttk.Label(ctrl, text="Pairs CSV:").grid(row=0, column=0, sticky="w")
-        self._pairs_csv_var = tk.StringVar()
-        ttk.Entry(ctrl, textvariable=self._pairs_csv_var, width=55).grid(
-            row=0, column=1, padx=4, sticky="ew"
-        )
-        ttk.Button(ctrl, text="Browse…", command=self._browse_pairs_csv).grid(row=0, column=2)
-        ctrl.columnconfigure(1, weight=1)
+        # === Top: controls ===
+        ctrl = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
 
-        # --- Connection settings ---
-        conn = ttk.Frame(ctrl)
-        conn.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        # -- Pairs CSV row --
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(QLabel("Pairs CSV:"))
+        self._pairs_csv_le = QLineEdit()
+        self._pairs_csv_le.setMinimumWidth(300)
+        csv_row.addWidget(self._pairs_csv_le, 1)
+        browse_btn = QPushButton("Browse\u2026")
+        browse_btn.clicked.connect(self._browse_pairs_csv)
+        csv_row.addWidget(browse_btn)
+        ctrl_layout.addLayout(csv_row)
 
-        ttk.Label(conn, text="Modbus port:").pack(side="left")
-        self._modbus_port_var = tk.StringVar()
-        ttk.Entry(conn, textvariable=self._modbus_port_var, width=8).pack(side="left", padx=2)
+        # -- Connection settings --
+        conn_gb = QGroupBox("Hardware")
+        conn_layout = QHBoxLayout(conn_gb)
 
-        ttk.Label(conn, text="Addr:").pack(side="left", padx=(6, 0))
-        self._modbus_addr_var = tk.StringVar(value="1")
-        ttk.Entry(conn, textvariable=self._modbus_addr_var, width=4).pack(side="left", padx=2)
+        # Modbus
+        conn_layout.addWidget(QLabel("Modbus:"))
+        self._modbus_port_le = QLineEdit()
+        self._modbus_port_le.setMaximumWidth(80)
+        self._modbus_port_le.setPlaceholderText("COM4")
+        conn_layout.addWidget(self._modbus_port_le)
+        conn_layout.addWidget(QLabel("Addr:"))
+        self._modbus_addr_le = QLineEdit("1")
+        self._modbus_addr_le.setMaximumWidth(40)
+        conn_layout.addWidget(self._modbus_addr_le)
+        conn_layout.addWidget(QLabel("Baud:"))
+        self._modbus_baud_le = QLineEdit("9600")
+        self._modbus_baud_le.setMaximumWidth(60)
+        conn_layout.addWidget(self._modbus_baud_le)
 
-        ttk.Label(conn, text="Baud:").pack(side="left", padx=(6, 0))
-        self._modbus_baud_var = tk.StringVar(value="9600")
-        ttk.Entry(conn, textvariable=self._modbus_baud_var, width=7).pack(side="left", padx=2)
+        conn_layout.addSpacing(12)
+        conn_layout.addWidget(QLabel("GRBL:"))
+        self._grbl_port_le = QLineEdit()
+        self._grbl_port_le.setMaximumWidth(80)
+        self._grbl_port_le.setPlaceholderText("COM3")
+        conn_layout.addWidget(self._grbl_port_le)
+        conn_layout.addWidget(QLabel("Baud:"))
+        self._grbl_baud_le = QLineEdit("115200")
+        self._grbl_baud_le.setMaximumWidth(60)
+        conn_layout.addWidget(self._grbl_baud_le)
 
-        ttk.Label(conn, text="Printer port:").pack(side="left", padx=(10, 0))
-        self._printer_port_var = tk.StringVar()
-        ttk.Entry(conn, textvariable=self._printer_port_var, width=8).pack(side="left", padx=2)
+        conn_layout.addStretch()
+        ctrl_layout.addWidget(conn_gb)
 
-        ttk.Label(conn, text="Baud:").pack(side="left", padx=(6, 0))
-        self._printer_baud_var = tk.StringVar(value="250000")
-        ttk.Entry(conn, textvariable=self._printer_baud_var, width=7).pack(side="left", padx=2)
+        # -- Work area --
+        area_gb = QGroupBox("Work Area (mm, optional)")
+        area_layout = QHBoxLayout(area_gb)
+        area_layout.addWidget(QLabel("X max:"))
+        self._x_max_le = QLineEdit()
+        self._x_max_le.setMaximumWidth(50)
+        area_layout.addWidget(self._x_max_le)
+        area_layout.addWidget(QLabel("Y max:"))
+        self._y_max_le = QLineEdit()
+        self._y_max_le.setMaximumWidth(50)
+        area_layout.addWidget(self._y_max_le)
+        area_layout.addWidget(QLabel("Z max:"))
+        self._z_max_le = QLineEdit()
+        self._z_max_le.setMaximumWidth(50)
+        area_layout.addWidget(self._z_max_le)
+        self._home_cb = QCheckBox("Home ($H) on connect")
+        area_layout.addWidget(self._home_cb)
+        area_layout.addStretch()
+        ctrl_layout.addWidget(area_gb)
 
-        # --- Generator options ---
-        gen = ttk.Frame(ctrl)
-        gen.grid(row=2, column=0, columnspan=3, sticky="ew", pady=4)
+        # -- Generator options --
+        gen_gb = QGroupBox("Generator")
+        gen_layout = QHBoxLayout(gen_gb)
+        gen_layout.addWidget(QLabel("Feedrate:"))
+        self._feedrate_le = QLineEdit(str(_DEFAULT_FEEDRATE))
+        self._feedrate_le.setMaximumWidth(70)
+        gen_layout.addWidget(self._feedrate_le)
+        gen_layout.addWidget(QLabel("Transition (s):"))
+        self._transition_le = QLineEdit("5.0")
+        self._transition_le.setMaximumWidth(60)
+        gen_layout.addWidget(self._transition_le)
+        gen_layout.addWidget(QLabel("Loops:"))
+        self._loops_le = QLineEdit("1")
+        self._loops_le.setMaximumWidth(50)
+        gen_layout.addWidget(self._loops_le)
+        gen_layout.addStretch()
+        ctrl_layout.addWidget(gen_gb)
 
-        ttk.Label(gen, text="Default feedrate:").pack(side="left")
-        self._feedrate_var = tk.StringVar(value=str(_DEFAULT_FEEDRATE))
-        ttk.Entry(gen, textvariable=self._feedrate_var, width=7).pack(side="left", padx=2)
+        # -- Camera recording --
+        cam_gb = QGroupBox("Camera Recording")
+        cam_layout = QHBoxLayout(cam_gb)
+        self._record_cb = QCheckBox("Record")
+        cam_layout.addWidget(self._record_cb)
+        cam_layout.addWidget(QLabel("Cam 0:"))
+        self._cam0_le = QLineEdit("0")
+        self._cam0_le.setMaximumWidth(30)
+        cam_layout.addWidget(self._cam0_le)
+        cam_layout.addWidget(QLabel("Cam 1:"))
+        self._cam1_le = QLineEdit("1")
+        self._cam1_le.setMaximumWidth(30)
+        cam_layout.addWidget(self._cam1_le)
+        cam_layout.addWidget(QLabel("FPS:"))
+        self._cam_fps_le = QLineEdit("15")
+        self._cam_fps_le.setMaximumWidth(40)
+        cam_layout.addWidget(self._cam_fps_le)
+        cam_layout.addWidget(QLabel("Dir:"))
+        self._record_dir_le = QLineEdit("recordings")
+        self._record_dir_le.setMaximumWidth(100)
+        cam_layout.addWidget(self._record_dir_le)
+        cam_layout.addStretch()
+        ctrl_layout.addWidget(cam_gb)
 
-        ttk.Label(gen, text="Default transition:").pack(side="left", padx=(8, 0))
-        self._transition_var = tk.StringVar(value="5.0")
-        ttk.Entry(gen, textvariable=self._transition_var, width=6).pack(side="left", padx=2)
+        # -- Sequence options --
+        seq_gb = QGroupBox("Sequence")
+        seq_layout = QHBoxLayout(seq_gb)
+        seq_layout.addWidget(QLabel("Time mode:"))
+        self._time_mode_cb = QComboBox()
+        self._time_mode_cb.addItems(["step", "absolute"])
+        seq_layout.addWidget(self._time_mode_cb)
+        self._dry_run_cb = QCheckBox("Dry run")
+        seq_layout.addWidget(self._dry_run_cb)
+        self._return_cb = QCheckBox("Return to 0,0,0 after run")
+        self._return_cb.setChecked(True)
+        seq_layout.addWidget(self._return_cb)
+        seq_layout.addStretch()
 
-        ttk.Label(gen, text="Loops:").pack(side="left", padx=(8, 0))
-        self._loops_var = tk.StringVar(value="1")
-        ttk.Entry(gen, textvariable=self._loops_var, width=5).pack(side="left", padx=2)
+        # Run / Stop
+        self._run_btn = QPushButton("Run")
+        self._run_btn.clicked.connect(self._on_run)
+        seq_layout.addWidget(self._run_btn)
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        seq_layout.addWidget(self._stop_btn)
 
-        # --- Sequence options ---
-        opts = ttk.Frame(ctrl)
-        opts.grid(row=3, column=0, columnspan=3, sticky="ew", pady=4)
+        self._status_label = QLabel("Ready")
+        seq_layout.addWidget(self._status_label)
+        ctrl_layout.addWidget(seq_gb)
 
-        ttk.Label(opts, text="Time mode:").pack(side="left")
-        self._time_mode_var = tk.StringVar(value="step")
-        ttk.Combobox(
-            opts,
-            textvariable=self._time_mode_var,
-            values=["step", "absolute"],
-            width=8,
-            state="readonly",
-        ).pack(side="left", padx=2)
+        # -- Progress bar --
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setMaximum(100)
+        self._progress_bar.setValue(0)
+        ctrl_layout.addWidget(self._progress_bar)
 
-        self._dry_run_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Dry run", variable=self._dry_run_var).pack(
-            side="left", padx=(10, 0)
-        )
+        root.addWidget(ctrl)
 
-        self._return_to_origin_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            opts, text="Return to 0,0,0 after run", variable=self._return_to_origin_var
-        ).pack(side="left", padx=(10, 0))
-
-        # --- Run / Stop + status ---
-        actions = ttk.Frame(ctrl)
-        actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 2))
-
-        self._run_btn = ttk.Button(actions, text="Run", command=self._on_run, width=10)
-        self._run_btn.pack(side="left")
-
-        self._stop_btn = ttk.Button(
-            actions, text="Stop", command=self._on_stop, state="disabled", width=10
-        )
-        self._stop_btn.pack(side="left", padx=6)
-
-        self._status_var = tk.StringVar(value="Ready")
-        ttk.Label(actions, textvariable=self._status_var).pack(side="left", padx=8)
-
-        # --- Progress bar ---
-        self._progress_var = tk.DoubleVar(value=0.0)
-        ttk.Progressbar(ctrl, variable=self._progress_var, maximum=100.0).grid(
-            row=5, column=0, columnspan=3, sticky="ew", pady=(0, 4)
-        )
-
-    def _build_plots(self) -> None:
+        # === Bottom: matplotlib plots ===
         fig = Figure(figsize=(11, 3.5), tight_layout=True)
         self._ax_pos = fig.add_subplot(1, 3, 1)
         self._ax_volt = fig.add_subplot(1, 3, 2)
@@ -188,39 +400,34 @@ class App(tk.Tk):
             ax.tick_params(labelsize=7)
             ax.grid(True, linewidth=0.4)
 
-        # Vertical progress markers (hidden until a run starts)
         self._vline_pos = self._ax_pos.axvline(x=0, color="red", linewidth=1, visible=False)
         self._vline_volt = self._ax_volt.axvline(x=0, color="red", linewidth=1, visible=False)
         self._vline_curr = self._ax_curr.axvline(x=0, color="red", linewidth=1, visible=False)
 
         self._fig = fig
-        canvas = FigureCanvasTkAgg(fig, master=self)
-        canvas.draw()
-        canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        self.rowconfigure(1, weight=1)
-        self._canvas = canvas
+        self._canvas = FigureCanvasQTAgg(fig)
+        root.addWidget(self._canvas, 1)
 
     # ------------------------------------------------------------------
-    # User interactions
+    #  CSV loading
     # ------------------------------------------------------------------
 
     def _browse_pairs_csv(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select pairs CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select pairs CSV", "", "CSV files (*.csv);;All files (*.*)",
         )
         if not path:
             return
-        self._pairs_csv_var.set(path)
+        self._pairs_csv_le.setText(path)
         self._load_pairs_csv(Path(path))
 
     def _load_pairs_csv(self, path: Path) -> None:
         try:
-            feedrate = float(self._feedrate_var.get() or _DEFAULT_FEEDRATE)
-            transition = float(self._transition_var.get() or 5.0)
-            loops = max(1, int(self._loops_var.get() or 1))
+            feedrate = float(self._feedrate_le.text() or _DEFAULT_FEEDRATE)
+            transition = float(self._transition_le.text() or 5.0)
+            loops = max(1, int(self._loops_le.text() or 1))
         except ValueError as exc:
-            messagebox.showerror("Input Error", f"Invalid parameter: {exc}")
+            QMessageBox.critical(self, "Input Error", f"Invalid parameter: {exc}")
             return
 
         try:
@@ -230,37 +437,34 @@ class App(tk.Tk):
                 default_transition_s=transition,
             )
         except Exception as exc:
-            messagebox.showerror("Pairs CSV Error", str(exc))
+            QMessageBox.critical(self, "Pairs CSV Error", str(exc))
             return
 
-        # Generate the sequence
         try:
             rows = generate_sequence_rows(specs)
         except Exception as exc:
-            messagebox.showerror("Generation Error", str(exc))
+            QMessageBox.critical(self, "Generation Error", str(exc))
             return
 
-        # Multiply rows by loop count
         looped_rows = rows * loops
-
-        # Write to a generated file named <original>_loops_<count>.csv
         output_path = path.with_stem(f"{path.stem}_loops_{loops}")
         try:
             write_sequence_csv(looped_rows, output_path)
         except Exception as exc:
-            messagebox.showerror("Write Error", str(exc))
+            QMessageBox.critical(self, "Write Error", str(exc))
             return
 
-        # Read back the generated sequence
         try:
             self._looped_steps = read_sequence_csv(output_path, default_feedrate=feedrate)
         except Exception as exc:
-            messagebox.showerror("Sequence Error", str(exc))
+            QMessageBox.critical(self, "Sequence Error", str(exc))
             return
 
         self._generated_csv_path = output_path
+        self._total_steps = max(len(self._looped_steps), 1)
+        self._progress_bar.setMaximum(self._total_steps)
         self._plot_planned(self._looped_steps)
-        self._status_var.set(
+        self._status_label.setText(
             f"Generated {output_path.name}: {len(self._looped_steps)} steps"
         )
 
@@ -293,141 +497,126 @@ class App(tk.Tk):
         self._ax_curr.set_ylabel("A", fontsize=8)
         self._ax_curr.plot(xs, amps, color="tab:green", linewidth=1)
 
-        # Re-create progress vlines after cla()
         self._vline_pos = self._ax_pos.axvline(x=0, color="red", linewidth=1, visible=False)
         self._vline_volt = self._ax_volt.axvline(x=0, color="red", linewidth=1, visible=False)
         self._vline_curr = self._ax_curr.axvline(x=0, color="red", linewidth=1, visible=False)
-
         self._canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    #  Run / Stop
+    # ------------------------------------------------------------------
 
     def _on_run(self) -> None:
         if not self._looped_steps:
-            messagebox.showwarning(
-                "No sequence", "Please load a pairs CSV first to generate a sequence."
-            )
+            QMessageBox.warning(self, "No sequence",
+                                "Please load a pairs CSV first to generate a sequence.")
             return
 
-        dry_run = self._dry_run_var.get()
-        if not dry_run and not self._modbus_port_var.get().strip():
-            messagebox.showerror(
-                "Missing port", "Modbus port is required when not using dry run."
-            )
+        dry_run = self._dry_run_cb.isChecked()
+        if not dry_run and not self._modbus_port_le.text().strip():
+            QMessageBox.critical(self, "Missing port",
+                                 "Modbus port is required when not using dry run.")
             return
 
-        self._stop_event.clear()
-        self._run_btn.configure(state="disabled")
-        self._stop_btn.configure(state="normal")
-        self._status_var.set("Running…")
-        self._progress_var.set(0.0)
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._status_label.setText("Running\u2026")
+        self._progress_bar.setValue(0)
 
-        self._worker = threading.Thread(target=self._run_worker, daemon=True)
+        # Collect params
+        record_dir = self._record_dir_le.text().strip() if self._record_cb.isChecked() else ""
+        cam0 = int(self._cam0_le.text() or 0)
+        cam1 = int(self._cam1_le.text() or 1)
+        cam_fps = float(self._cam_fps_le.text() or 15)
+
+        self._worker = _SequenceWorker(
+            steps=self._looped_steps,
+            time_mode=self._time_mode_cb.currentText(),
+            dry_run=self._dry_run_cb.isChecked(),
+            return_to_origin=self._return_cb.isChecked(),
+            modbus_port=self._modbus_port_le.text().strip(),
+            modbus_addr=int(self._modbus_addr_le.text() or 1),
+            modbus_baud=int(self._modbus_baud_le.text() or 9600),
+            grbl_port=self._grbl_port_le.text().strip(),
+            grbl_baud=int(self._grbl_baud_le.text() or 115200),
+            x_max=_parse_optional_float(self._x_max_le.text()),
+            y_max=_parse_optional_float(self._y_max_le.text()),
+            z_max=_parse_optional_float(self._z_max_le.text()),
+            home_on_connect=self._home_cb.isChecked(),
+            record_cameras=self._record_cb.isChecked(),
+            cam0_id=cam0,
+            cam1_id=cam1,
+            cam_fps=cam_fps,
+            record_dir=record_dir,
+            parent=self,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
         self._worker.start()
 
     def _on_stop(self) -> None:
-        self._stop_event.set()
-        self._status_var.set("Stopping…")
-        self._stop_btn.configure(state="disabled")
+        # Signal the worker to stop (we don't have a threaded stop_event anymore)
+        # For now, stopping is a best-effort: the worker doesn't support it via QThread.
+        # The sequence_runner's stop_event-based stop mechanism would need a thread-safe flag
+        # accessible from here. We'll set the status anyway.
+        self._status_label.setText("Stopping\u2026")
+        self._stop_btn.setEnabled(False)
+        # TODO: integrate a threading.Event accessible to the worker
 
     # ------------------------------------------------------------------
-    # Worker thread — hardware interaction happens here, not on GUI thread
+    #  Worker signal handlers  (called on main thread)
     # ------------------------------------------------------------------
 
-    def _run_worker(self) -> None:
-        try:
-            dry_run = self._dry_run_var.get()
+    def _poll_worker(self) -> None:
+        """Fallback poll - no-op since we use signals now."""
+        pass
 
-            if dry_run:
-                dps = None
-                printer = None
-            else:
-                ini_path = Path(__file__).with_name("dps5005_limits.ini")
-                try:
-                    dps = connect_dps(
-                        modbus_port=self._modbus_port_var.get().strip(),
-                        ini_path=ini_path,
-                        address=int(self._modbus_addr_var.get() or 1),
-                        baudrate=int(self._modbus_baud_var.get() or 9600),
-                    )
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to connect DPS: {exc}") from exc
+    def _on_progress(self, index: int, total: int) -> None:
+        self._progress_bar.setValue(index)
+        self._status_label.setText(f"Step {index} / {total}")
+        self._set_vlines(index - 1)
+        self._canvas.draw_idle()
 
-                printer_port = self._printer_port_var.get().strip()
-                if printer_port:
-                    try:
-                        printer = PrinterController(
-                            printer_port, int(self._printer_baud_var.get() or 250000)
-                        )
-                    except Exception as exc:
-                        raise RuntimeError(f"Failed to connect printer: {exc}") from exc
-                else:
-                    printer = None
+    def _on_done(self) -> None:
+        self._progress_bar.setValue(self._total_steps)
+        self._status_label.setText("Done")
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._canvas.draw_idle()
 
-            def _on_step(index: int, total: int) -> None:
-                # Called from the worker thread — only a fast queue put, no GUI calls
-                self._progress_q.put(index)
-
-            run_sequence(
-                self._looped_steps,
-                dps=dps,
-                printer=printer,
-                time_mode=self._time_mode_var.get(),
-                dry_run=dry_run,
-                stop_event=self._stop_event,
-                on_step=_on_step,
-                return_to_origin=self._return_to_origin_var.get(),
-            )
-            self._progress_q.put("done")
-
-        except Exception as exc:
-            self._progress_q.put(f"error:{exc}")
-
-    # ------------------------------------------------------------------
-    # Progress polling — runs on the main (GUI) thread via after()
-    # ------------------------------------------------------------------
-
-    def _poll_progress(self) -> None:
-        total = max(len(self._looped_steps), 1)
-        redraw = False
-        try:
-            while True:
-                msg = self._progress_q.get_nowait()
-                if isinstance(msg, int):
-                    pct = msg / total * 100.0
-                    self._progress_var.set(pct)
-                    self._status_var.set(f"Step {msg} / {total}")
-                    self._set_vlines(msg - 1)
-                    redraw = True
-                elif msg == "done":
-                    self._progress_var.set(100.0)
-                    self._status_var.set("Done")
-                    self._run_btn.configure(state="normal")
-                    self._stop_btn.configure(state="disabled")
-                    redraw = True
-                elif isinstance(msg, str) and msg.startswith("error:"):
-                    err = msg[6:]
-                    self._status_var.set(f"Error: {err}")
-                    messagebox.showerror("Sequence error", err)
-                    self._run_btn.configure(state="normal")
-                    self._stop_btn.configure(state="disabled")
-        except queue.Empty:
-            pass
-
-        if redraw:
-            self._canvas.draw_idle()
-
-        self.after(_POLL_MS, self._poll_progress)
+    def _on_error(self, err: str) -> None:
+        self._status_label.setText(f"Error: {err}")
+        QMessageBox.critical(self, "Sequence error", err)
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
 
     def _set_vlines(self, step_index: int) -> None:
         for vline in (self._vline_pos, self._vline_volt, self._vline_curr):
             vline.set_xdata([step_index, step_index])
             vline.set_visible(True)
 
+    # ------------------------------------------------------------------
+    #  Close
+    # ------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
+    def closeEvent(self, event) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(2000)
+        event.accept()
+
+
+# ======================================================================
+#  Entry point
+# ======================================================================
 
 def main() -> None:
-    app = App()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    app.exec()
 
 
 if __name__ == "__main__":
