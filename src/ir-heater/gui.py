@@ -45,7 +45,8 @@ _SR_DIR = Path(__file__).parent
 if str(_SR_DIR) not in sys.path:
     sys.path.insert(0, str(_SR_DIR))
 
-from camera_controller import CameraController
+from camera_controller import CameraController, CameraSpec
+from camera_setup_dialog import CameraSetupDialog
 from sequence_generator import (
     generate_sequence_rows,
     read_pair_specs_csv,
@@ -104,8 +105,7 @@ class _SequenceWorker(QThread):
         y_max: float | None,
         z_max: float | None,
         record_cameras: bool,
-        cam0_id: int,
-        cam1_id: int,
+        camera_specs: list[CameraSpec],
         cam_fps: float,
         record_dir: str,
         parent: QWidget | None = None,
@@ -124,8 +124,7 @@ class _SequenceWorker(QThread):
         self._y_max = y_max
         self._z_max = z_max
         self._record_cameras = record_cameras
-        self._cam0_id = cam0_id
-        self._cam1_id = cam1_id
+        self._camera_specs = camera_specs
         self._cam_fps = cam_fps
         self._record_dir = record_dir
 
@@ -153,10 +152,8 @@ class _SequenceWorker(QThread):
                         z_max=self._z_max,
                     )
 
-            if self._record_cameras and self._record_dir:
-                cameras = CameraController(
-                    cam0_id=self._cam0_id, cam1_id=self._cam1_id, fps=self._cam_fps,
-                )
+            if self._record_cameras and self._record_dir and self._camera_specs:
+                cameras = CameraController(cameras=self._camera_specs, fps=self._cam_fps)
                 record_dir = Path(self._record_dir)
 
             # --- Metadata ---
@@ -175,8 +172,7 @@ class _SequenceWorker(QThread):
                 dps_port=self._modbus_port,
                 dps_address=self._modbus_addr,
                 dps_baud=self._modbus_baud,
-                cam0_id=self._cam0_id,
-                cam1_id=self._cam1_id,
+                cameras=dict(self._camera_specs),
                 cam_fps=self._cam_fps,
                 record_dir=self._record_dir,
             )
@@ -332,18 +328,17 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(gen_gb)
 
         # -- Camera recording --
+        self._camera_specs: list[CameraSpec] = []
         cam_gb = QGroupBox("Camera Recording")
         cam_layout = QHBoxLayout(cam_gb)
         self._record_cb = QCheckBox("Record")
         cam_layout.addWidget(self._record_cb)
-        cam_layout.addWidget(QLabel("Cam 0:"))
-        self._cam0_le = QLineEdit("0")
-        self._cam0_le.setMaximumWidth(30)
-        cam_layout.addWidget(self._cam0_le)
-        cam_layout.addWidget(QLabel("Cam 1:"))
-        self._cam1_le = QLineEdit("1")
-        self._cam1_le.setMaximumWidth(30)
-        cam_layout.addWidget(self._cam1_le)
+        configure_cams_btn = QPushButton("Configure Cameras…")
+        configure_cams_btn.setToolTip("Identify cameras by live preview and assign labels")
+        configure_cams_btn.clicked.connect(self._configure_cameras)
+        cam_layout.addWidget(configure_cams_btn)
+        self._cameras_summary_label = QLabel("None configured")
+        cam_layout.addWidget(self._cameras_summary_label)
         cam_layout.addWidget(QLabel("FPS:"))
         self._cam_fps_le = QLineEdit("15")
         self._cam_fps_le.setMaximumWidth(40)
@@ -447,6 +442,20 @@ class MainWindow(QMainWindow):
             return
         self._grbl_port_cb.setCurrentText(port)
         self._status_label.setText(f"Found GRBL on {port}")
+
+    # ------------------------------------------------------------------
+    #  Camera identification
+    # ------------------------------------------------------------------
+
+    def _configure_cameras(self) -> None:
+        dlg = CameraSetupDialog(current=self._camera_specs, parent=self)
+        if dlg.exec() == CameraSetupDialog.Accepted:
+            self._camera_specs = dlg.selected_cameras()
+            if self._camera_specs:
+                summary = ", ".join(f"{label}:{idx}" for label, idx in self._camera_specs)
+            else:
+                summary = "None configured"
+            self._cameras_summary_label.setText(summary)
 
     # ------------------------------------------------------------------
     #  CSV loading
@@ -557,6 +566,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Missing port",
                                  "Modbus port is required when not using dry run.")
             return
+        if self._record_cb.isChecked() and not self._camera_specs:
+            QMessageBox.critical(self, "No cameras configured",
+                                 "Click \"Configure Cameras\u2026\" first, or uncheck Record.")
+            return
 
         self._run_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -565,8 +578,6 @@ class MainWindow(QMainWindow):
 
         # Collect params
         record_dir = self._record_dir_le.text().strip() if self._record_cb.isChecked() else ""
-        cam0 = int(self._cam0_le.text() or 0)
-        cam1 = int(self._cam1_le.text() or 1)
         cam_fps = float(self._cam_fps_le.text() or 15)
 
         self._worker = _SequenceWorker(
@@ -583,8 +594,7 @@ class MainWindow(QMainWindow):
             y_max=_parse_optional_float(self._y_max_le.text()),
             z_max=_parse_optional_float(self._z_max_le.text()),
             record_cameras=self._record_cb.isChecked(),
-            cam0_id=cam0,
-            cam1_id=cam1,
+            camera_specs=self._camera_specs,
             cam_fps=cam_fps,
             record_dir=record_dir,
             parent=self,

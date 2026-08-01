@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import multiprocessing
 import sys
 import threading
@@ -15,7 +16,7 @@ from pathlib import Path
 import serial as pyserial
 from serial.tools import list_ports as _list_ports
 
-from camera_controller import CameraController, CameraRecorderProcess
+from camera_controller import CameraController, CameraRecorderProcess, CameraSpec
 from dps_modbus import Dps5005, Import_limits, Serial_modbus
 
 
@@ -28,6 +29,11 @@ class SequenceStep:
     y: float
     z: float
     feedrate: float
+    # Arc move (G2/G3): center offset from the *previous* step's position,
+    # GRBL's native I/J convention. None on both = ordinary linear move (G1).
+    arc_i: float | None = None
+    arc_j: float | None = None
+    arc_cw: bool = True
 
 
 @dataclass
@@ -59,16 +65,16 @@ class RunMetadata:
     dps_baud: int = 9600
 
     # Cameras
-    cam0_id: int | None = None
-    cam1_id: int | None = None
+    cameras: dict[str, int] = field(default_factory=dict)  # label -> device index
     cam_fps: float = 15.0
     record_dir: str = ""
-    recording_paths: list[str] = field(default_factory=list)
+    recording_paths: dict[str, str] = field(default_factory=dict)  # label -> output path
 
     # Results
     total_steps: int = 0
     steps_completed: int = 0
     error: str = ""
+    drift_warnings: list[str] = field(default_factory=list)
 
 
 def save_run_metadata(meta: RunMetadata, output_dir: Path) -> Path:
@@ -152,6 +158,22 @@ def read_sequence_csv(csv_path: Path, default_feedrate: float) -> list[SequenceS
             if voltage_v < 0:
                 raise ValueError(f"Voltage must be >= 0 at CSV line {line_number}")
 
+            # Optional arc move (G2/G3). Named arc_i/arc_j rather than the
+            # bare i/j GRBL itself uses, since "i" already aliases the
+            # current_a column above -- a bare "i" column would be ambiguous.
+            arc_i_raw = _first_value(normalized, ("arc_i",))
+            arc_j_raw = _first_value(normalized, ("arc_j",))
+            arc_i = float(arc_i_raw) if arc_i_raw != "" else None
+            arc_j = float(arc_j_raw) if arc_j_raw != "" else None
+            if (arc_i is None) != (arc_j is None):
+                raise ValueError(
+                    f"arc_i and arc_j must both be given or both omitted at CSV line {line_number}"
+                )
+            arc_dir = _first_value(normalized, ("arc_dir",)).strip().lower()
+            if arc_dir not in ("", "cw", "ccw"):
+                raise ValueError(f"arc_dir must be 'cw' or 'ccw' at CSV line {line_number}")
+            arc_cw = arc_dir != "ccw"
+
             steps.append(
                 SequenceStep(
                     time_s=time_s,
@@ -161,6 +183,9 @@ def read_sequence_csv(csv_path: Path, default_feedrate: float) -> list[SequenceS
                     y=y,
                     z=z,
                     feedrate=feedrate,
+                    arc_i=arc_i,
+                    arc_j=arc_j,
+                    arc_cw=arc_cw,
                 )
             )
 
@@ -325,6 +350,7 @@ class GrblController:
         self._x_max = x_max
         self._y_max = y_max
         self._z_max = z_max
+        self._last_feedrate: float | None = None
 
         print(f"Connected to {banner.decode(errors='replace').strip()}", flush=True)
 
@@ -370,20 +396,30 @@ class GrblController:
             self._serial.read(self._serial.in_waiting)
             time.sleep(0.05)
 
-    def _send_line(self, line: str) -> str:
-        """Send one G-code / system line and wait for GRBL's response."""
+    def _send_line(self, line: str, timeout_s: float = 10.0) -> str:
+        """Send one G-code / system line and wait for GRBL's response.
+
+        Raises ``TimeoutError`` if no ``ok``/``error`` reply arrives within
+        *timeout_s*.  GRBL should always reply, but a dropped byte or a
+        wedged serial link must never hang the caller -- this used to loop
+        forever, which froze the whole GUI when called from a jog button.
+        """
         self._serial.write(line.encode() + b"\n")
         response_parts: list[str] = []
-        while True:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
             resp = self._serial.readline()
             if not resp:
-                continue  # timeout – keep waiting
+                continue  # per-read timeout – keep waiting up to the deadline
             decoded = resp.decode(errors="replace").strip()
             if decoded:
                 response_parts.append(decoded)
             if "ok" in decoded or "error" in decoded:
-                break
-        return "\n".join(response_parts)
+                return "\n".join(response_parts)
+        raise TimeoutError(
+            f"No response from GRBL to {line!r} within {timeout_s:.1f}s "
+            f"(received so far: {response_parts!r})"
+        )
 
     # ------------------------------------------------------------------
     #  Public API  (compatible with the old PrinterController)
@@ -396,12 +432,67 @@ class GrblController:
         y = max(0.0, min(y, self._y_max)) if self._y_max is not None else y
         z = max(0.0, min(z, self._z_max)) if self._z_max is not None else z
 
-        resp1 = self._send_line(f"G1 F{feedrate:.2f}")
-        if "error" in resp1:
-            print(f"GRBL error setting feedrate: {resp1}", flush=True)
+        if self._last_feedrate != feedrate:
+            resp1 = self._send_line(f"G1 F{feedrate:.2f}")
+            if "error" in resp1:
+                print(f"GRBL error setting feedrate: {resp1}", flush=True)
+            self._last_feedrate = feedrate
         resp2 = self._send_line(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f}")
         if "error" in resp2:
             print(f"GRBL error on move: {resp2}", flush=True)
+
+    def send_arc(
+        self,
+        from_x: float,
+        from_y: float,
+        x: float,
+        y: float,
+        z: float,
+        i: float,
+        j: float,
+        feedrate: float,
+        cw: bool = True,
+    ) -> None:
+        """Queue a circular arc move (G2/G3) to absolute X/Y (mm, G90).
+
+        *i*, *j* are GRBL's native arc-center offsets: the vector from the
+        arc's start point (*from_x*, *from_y*, the previous step's target)
+        to its center.
+
+        Unlike ``send_move``, this does **not** clamp to the configured
+        work-area limits. Clamping only the endpoint would leave *i*/*j*
+        pointing at a center that no longer matches the (clamped) start and
+        end points, and GRBL rejects an arc whose endpoint isn't actually on
+        the circle its center describes. Instead the full circle's bounding
+        box is checked up front and rejected clearly, rather than sent as a
+        command GRBL would refuse anyway.
+        """
+        z = max(0.0, min(z, self._z_max)) if self._z_max is not None else z
+
+        cx, cy = from_x + i, from_y + j
+        radius = math.hypot(i, j)
+        for limit, lo, hi, axis in (
+            (self._x_max, cx - radius, cx + radius, "X"),
+            (self._y_max, cy - radius, cy + radius, "Y"),
+        ):
+            if limit is not None and (lo < 0.0 or hi > limit):
+                raise ValueError(
+                    f"Arc centered at ({cx:.3f}, {cy:.3f}) r={radius:.3f} would "
+                    f"exceed the configured {axis} work area [0, {limit}] -- "
+                    "refusing to send (clamping would corrupt the arc geometry)."
+                )
+
+        if self._last_feedrate != feedrate:
+            self._last_feedrate = feedrate
+            feed_word = f" F{feedrate:.2f}"
+        else:
+            feed_word = ""
+        cmd = "G2" if cw else "G3"
+        resp = self._send_line(
+            f"{cmd} X{x:.3f} Y{y:.3f} Z{z:.3f} I{i:.3f} J{j:.3f}{feed_word}"
+        )
+        if "error" in resp:
+            print(f"GRBL error on arc move: {resp}", flush=True)
 
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
@@ -416,6 +507,76 @@ class GrblController:
     def disconnect(self) -> None:
         """Close the serial connection."""
         self._serial.close()
+
+
+def _arc_length_mm(x0: float, y0: float, x1: float, y1: float, i: float, j: float, cw: bool) -> float:
+    """Length (mm) of a G2/G3 arc from (x0,y0) to (x1,y1), center offset i/j from the start."""
+    cx, cy = x0 + i, y0 + j
+    radius = math.hypot(i, j)
+    if radius <= 1e-9:
+        return 0.0
+    if abs(x1 - x0) < 1e-6 and abs(y1 - y0) < 1e-6:
+        swept = 2 * math.pi  # start == end -> full circle
+    else:
+        start_angle = math.atan2(y0 - cy, x0 - cx)
+        end_angle = math.atan2(y1 - cy, x1 - cx)
+        swept = (start_angle - end_angle) % (2 * math.pi) if cw else (end_angle - start_angle) % (2 * math.pi)
+    return radius * swept
+
+
+def _parse_mpos(status: str) -> tuple[float, float] | None:
+    """Extract (X, Y) from a GRBL ``?`` status report's MPos/WPos field."""
+    for part in status.split("|"):
+        if part.startswith("MPos:") or part.startswith("WPos:"):
+            coords = part.split(":", 1)[1].split(",")
+            if len(coords) >= 2:
+                try:
+                    return float(coords[0]), float(coords[1])
+                except ValueError:
+                    return None
+    return None
+
+
+_DRIFT_CHECK_INTERVAL_S = 5.0
+_DRIFT_WARN_FRACTION = 0.5
+_DRIFT_MIN_EXPECTED_MM = 2.0
+
+
+def _check_motion_drift(
+    printer: GrblController,
+    now: float,
+    last_check_t: float,
+    last_check_pos: tuple[float, float] | None,
+    scheduled_distance_mm: float,
+    metadata: RunMetadata | None,
+) -> tuple[float, tuple[float, float] | None, float]:
+    """Compare GRBL's real position movement against the schedule's implied
+    distance since the last check, and warn on substantial drift.
+
+    Call this only every few seconds of wall-clock time (see
+    ``_DRIFT_CHECK_INTERVAL_S``), never per-step -- a single extra ``?``
+    query is cheap, but doing it on every fine-grained dwell segment would
+    add serial round-trips right where timing is tightest.
+
+    Returns updated ``(last_check_t, last_check_pos, scheduled_distance_mm)``
+    for the caller to carry into the next window.
+    """
+    status = printer.get_status()
+    pos = _parse_mpos(status)
+    elapsed = now - last_check_t
+    if pos is not None and last_check_pos is not None and scheduled_distance_mm >= _DRIFT_MIN_EXPECTED_MM:
+        actual_mm = math.dist(last_check_pos, pos)
+        if actual_mm < scheduled_distance_mm * _DRIFT_WARN_FRACTION:
+            msg = (
+                f"WARNING: motion drift -- gantry covered {actual_mm:.1f}mm in the "
+                f"last {elapsed:.1f}s, schedule expected ~{scheduled_distance_mm:.1f}mm. "
+                "Physical position may be lagging the commanded schedule (e.g. "
+                "dwell_time_s/feedrate too aggressive for the hardware)."
+            )
+            print(msg, flush=True)
+            if metadata is not None:
+                metadata.drift_warnings.append(msg)
+    return now, (pos if pos is not None else last_check_pos), 0.0
 
 
 def connect_dps(modbus_port: str, ini_path: Path, address: int, baudrate: int) -> Dps5005:
@@ -443,16 +604,18 @@ def run_sequence(
     if not dry_run and dps is None:
         raise ValueError("dps instance is required when dry_run is False")
 
-    if not dry_run:
-        assert dps is not None  # narrowed by the guard above
-        dps.onoff("w", 1)
-
     home_step: SequenceStep | None = steps[0] if steps else None
     previous_t = 0.0
     scheduled_elapsed = 0.0
     start_monotonic = time.perf_counter()
     last_voltage: float | None = None
     last_current: float | None = None
+    prev_x, prev_y, prev_z = 0.0, 0.0, 0.0
+
+    # --- Periodic motion-drift verification state (see _check_motion_drift) ---
+    drift_check_t = start_monotonic
+    drift_check_pos: tuple[float, float] | None = None
+    drift_scheduled_distance_mm = 0.0
 
     # --- Camera recording (separate process — never blocks timing loop) ---
     _cam_proc: CameraRecorderProcess | None = None
@@ -462,8 +625,7 @@ def run_sequence(
         _cam_cmd_q = multiprocessing.Queue()
         _cam_res_q = multiprocessing.Queue()
         _cam_proc = CameraRecorderProcess(
-            cam0_id=cameras.cam0_id,
-            cam1_id=cameras.cam1_id,
+            cameras=cameras.camera_specs,
             fps=cameras.fps,
             cmd_queue=_cam_cmd_q,
             result_queue=_cam_res_q,
@@ -474,9 +636,9 @@ def run_sequence(
         try:
             msg = _cam_res_q.get(timeout=10.0)
             if msg[0] == "started" and metadata is not None:
-                metadata.recording_paths = [msg[1], msg[2]]
-                print(f"Recording cam0 -> {msg[1]}", flush=True)
-                print(f"Recording cam1 -> {msg[2]}", flush=True)
+                metadata.recording_paths = dict(msg[1])
+                for label, path in msg[1].items():
+                    print(f"Recording {label} -> {path}", flush=True)
         except Exception:
             pass
 
@@ -485,8 +647,11 @@ def run_sequence(
         metadata.total_steps = len(steps)
 
     steps_completed = 0
-    steps_completed = 0
     try:
+        if not dry_run:
+            assert dps is not None  # narrowed by the entry guard
+            dps.onoff("w", 1)
+
         for index, step in enumerate(steps, start=1):
             if stop_event is not None and stop_event.is_set():
                 print("\nStop requested — aborting sequence.", flush=True)
@@ -501,8 +666,25 @@ def run_sequence(
                     dps.current_set("w", step.current_a)
                     last_current = step.current_a
 
+            is_arc = step.arc_i is not None and step.arc_j is not None
             if printer is not None:
-                printer.send_move(step.x, step.y, step.z, step.feedrate)
+                if is_arc:
+                    printer.send_arc(
+                        prev_x, prev_y, step.x, step.y, step.z,
+                        step.arc_i, step.arc_j, step.feedrate, cw=step.arc_cw,
+                    )
+                else:
+                    printer.send_move(step.x, step.y, step.z, step.feedrate)
+
+            if is_arc:
+                drift_scheduled_distance_mm += _arc_length_mm(
+                    prev_x, prev_y, step.x, step.y, step.arc_i, step.arc_j, step.arc_cw
+                )
+            else:
+                drift_scheduled_distance_mm += math.dist(
+                    (prev_x, prev_y, prev_z), (step.x, step.y, step.z)
+                )
+            prev_x, prev_y, prev_z = step.x, step.y, step.z
 
             print(
                 f"Step {index:04d}: "
@@ -536,6 +718,19 @@ def run_sequence(
                         break
                 else:
                     time.sleep(wait_s)
+
+            # --- Periodic (not per-step) real-position drift check ---
+            if printer is not None and not dry_run:
+                now = time.perf_counter()
+                if (now - drift_check_t) >= _DRIFT_CHECK_INTERVAL_S:
+                    drift_check_t, drift_check_pos, drift_scheduled_distance_mm = _check_motion_drift(
+                        printer, now, drift_check_t, drift_check_pos,
+                        drift_scheduled_distance_mm, metadata,
+                    )
+    except Exception as exc:
+        if metadata is not None:
+            metadata.error = str(exc)
+        raise
     finally:
         # --- Stop camera process ---
         if _cam_proc is not None:
@@ -543,7 +738,7 @@ def run_sequence(
             try:
                 msg = _cam_res_q.get(timeout=10.0)
                 if msg[0] == "stopped":
-                    print(f"Recording stopped: {msg[1]}, {msg[2]}", flush=True)
+                    print(f"Recording stopped: {msg[1]}", flush=True)
             except Exception:
                 pass
             _cam_cmd_q.put(("shutdown",))
@@ -647,14 +842,50 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="After the sequence ends return to the first CSV position instead of 0,0,0 (default: return to origin)",
     )
-    parser.add_argument("--cam0", type=int, default=None, help="USB camera 0 device ID for recording")
-    parser.add_argument("--cam1", type=int, default=None, help="USB camera 1 device ID for recording")
+    parser.add_argument(
+        "--camera", action="append", default=[], metavar="LABEL:INDEX",
+        help="Add a camera as label:device_index for recording (repeatable, "
+             "e.g. --camera top:0 --camera side:1). Use --list-cameras to "
+             "see what's plugged in.",
+    )
+    parser.add_argument(
+        "--list-cameras", action="store_true",
+        help="Probe device indices 0-9 for a responsive camera and exit",
+    )
     parser.add_argument("--cam-fps", type=float, default=15.0, help="Camera recording framerate")
     parser.add_argument(
         "--record-dir", type=Path, default=None,
-        help="Directory to save camera recordings (required if --cam0/--cam1 is set)",
+        help="Directory to save camera recordings (required if --camera is set)",
     )
     return parser.parse_args()
+
+
+def _parse_camera_specs(raw: list[str]) -> list[CameraSpec]:
+    specs: list[CameraSpec] = []
+    for item in raw:
+        label, sep, idx_str = item.partition(":")
+        label = label.strip()
+        if not sep or not label:
+            raise SystemExit(f"error: --camera must be LABEL:INDEX, got {item!r}")
+        try:
+            idx = int(idx_str.strip())
+        except ValueError as exc:
+            raise SystemExit(f"error: --camera index must be an integer, got {item!r}") from exc
+        specs.append((label, idx))
+    return specs
+
+
+def list_available_cameras(max_index: int = 10) -> list[int]:
+    """Return every device index in ``range(max_index)`` that opens successfully."""
+    from camera_controller import _open_capture
+
+    found = []
+    for index in range(max_index):
+        cap = _open_capture(index, attempts=1, retry_delay=0.0)
+        if cap.isOpened():
+            found.append(index)
+        cap.release()
+    return found
 
 
 def _stdin_stop_listener(stop_event: threading.Event) -> None:
@@ -677,8 +908,13 @@ def main() -> None:
             print(f"{device}\t{description}")
         return
 
+    if args.list_cameras:
+        for index in list_available_cameras():
+            print(index)
+        return
+
     if args.csv is None:
-        raise SystemExit("error: --csv is required (unless --list-ports)")
+        raise SystemExit("error: --csv is required (unless --list-ports/--list-cameras)")
 
     steps = read_sequence_csv(args.csv, default_feedrate=args.default_feedrate)
     looped_steps = expand_loop_steps(steps, args.loops)
@@ -709,11 +945,10 @@ def main() -> None:
     )
 
     # --- Cameras ---
+    camera_specs = _parse_camera_specs(args.camera)
     cameras: CameraController | None = None
-    if args.cam0 is not None or args.cam1 is not None:
-        cam0 = args.cam0 if args.cam0 is not None else 0
-        cam1 = args.cam1 if args.cam1 is not None else 1
-        cameras = CameraController(cam0_id=cam0, cam1_id=cam1, fps=args.cam_fps)
+    if camera_specs:
+        cameras = CameraController(cameras=camera_specs, fps=args.cam_fps)
 
     # --- Metadata ---
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -733,8 +968,7 @@ def main() -> None:
         dps_port=args.modbus_port,
         dps_address=args.modbus_address,
         dps_baud=args.modbus_baud,
-        cam0_id=args.cam0,
-        cam1_id=args.cam1,
+        cameras=dict(camera_specs),
         cam_fps=args.cam_fps,
         record_dir=str(args.record_dir) if args.record_dir else "",
     )

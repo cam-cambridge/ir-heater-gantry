@@ -52,7 +52,8 @@ _SR_DIR = Path(__file__).parent
 if str(_SR_DIR) not in sys.path:
     sys.path.insert(0, str(_SR_DIR))
 
-from camera_controller import CameraController
+from camera_controller import CameraController, CameraSpec
+from camera_setup_dialog import CameraSetupDialog
 from dps_modbus import Dps5005, Import_limits, Serial_modbus
 from sequence_runner import GrblController, find_grbl_port, list_serial_ports
 
@@ -129,16 +130,17 @@ class ConnectDialog(QDialog):
         layout.addWidget(dps_gb)
 
         # --- Cameras ---
+        self._camera_specs: list[CameraSpec] = []
         cam_gb = QGroupBox("Cameras")
         cam_form = QFormLayout(cam_gb)
-        self._cam0_id = QLineEdit("0")
-        self._cam0_id.setMaximumWidth(50)
-        self._cam1_id = QLineEdit("1")
-        self._cam1_id.setMaximumWidth(50)
+        configure_cams_btn = QPushButton("Configure Cameras…")
+        configure_cams_btn.setToolTip("Identify cameras by live preview and assign labels")
+        configure_cams_btn.clicked.connect(self._configure_cameras)
+        cam_form.addRow("", configure_cams_btn)
+        self._cameras_summary_label = QLabel("None configured")
+        cam_form.addRow("Selected:", self._cameras_summary_label)
         self._cam_fps = QLineEdit("15")
         self._cam_fps.setMaximumWidth(50)
-        cam_form.addRow("Cam 0 ID:", self._cam0_id)
-        cam_form.addRow("Cam 1 ID:", self._cam1_id)
         cam_form.addRow("FPS:", self._cam_fps)
         layout.addWidget(cam_gb)
 
@@ -155,8 +157,18 @@ class ConnectDialog(QDialog):
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
 
-        self._result: dict[str, str] = {}
+        self._result: dict[str, object] = {}
         self._refresh_ports()
+
+    def _configure_cameras(self) -> None:
+        dlg = CameraSetupDialog(current=self._camera_specs, parent=self)
+        if dlg.exec() == CameraSetupDialog.Accepted:
+            self._camera_specs = dlg.selected_cameras()
+            if self._camera_specs:
+                summary = ", ".join(f"{label}:{idx}" for label, idx in self._camera_specs)
+            else:
+                summary = "None configured"
+            self._cameras_summary_label.setText(summary)
 
     def _refresh_ports(self) -> None:
         """Re-scan available serial ports and repopulate both port combos.
@@ -193,8 +205,7 @@ class ConnectDialog(QDialog):
             "dps_port": self._dps_port.currentText().strip(),
             "dps_addr": self._dps_addr.text().strip(),
             "dps_baud": self._dps_baud.text().strip(),
-            "cam0_id": self._cam0_id.text().strip(),
-            "cam1_id": self._cam1_id.text().strip(),
+            "cameras": self._camera_specs,
             "cam_fps": self._cam_fps.text().strip(),
         }
         self.accept()
@@ -203,7 +214,7 @@ class ConnectDialog(QDialog):
         self._result = {"skip": "1"}
         self.accept()
 
-    def result(self) -> dict[str, str]:
+    def result(self) -> dict[str, object]:
         return self._result
 
 
@@ -212,7 +223,7 @@ class ConnectDialog(QDialog):
 # ======================================================================
 
 class AlignmentWindow(QMainWindow):
-    def __init__(self, cfg: dict[str, str]) -> None:
+    def __init__(self, cfg: dict[str, object]) -> None:
         super().__init__()
         self.setWindowTitle("IR Heater \u2014 Alignment & Jog")
         self.resize(1280, 720)
@@ -221,6 +232,8 @@ class AlignmentWindow(QMainWindow):
         self._grbl: GrblController | None = None
         self._dps: Dps5005 | None = None
         self._cameras: CameraController | None = None
+        self._camera_specs: list[CameraSpec] = cfg.get("cameras") or []
+        self._cam_labels: dict[str, QLabel] = {}
 
         # --- Saved positions ---
         self._saved_positions: list[dict[str, str]] = []
@@ -248,22 +261,24 @@ class AlignmentWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal, central)
 
-        # --- Left: camera preview ---
+        # --- Left: camera preview (one panel per configured camera) ---
         cam_panel = QWidget()
         cam_layout = QHBoxLayout(cam_panel)
         cam_layout.setContentsMargins(4, 4, 4, 4)
 
-        self._cam_label0 = QLabel("Camera 0\n(not connected)")
-        self._cam_label0.setAlignment(Qt.AlignCenter)
-        self._cam_label0.setStyleSheet("background: #1a1a1a; color: #888;")
-        self._cam_label0.setMinimumWidth(320)
-        cam_layout.addWidget(self._cam_label0)
-
-        self._cam_label1 = QLabel("Camera 1\n(not connected)")
-        self._cam_label1.setAlignment(Qt.AlignCenter)
-        self._cam_label1.setStyleSheet("background: #1a1a1a; color: #888;")
-        self._cam_label1.setMinimumWidth(320)
-        cam_layout.addWidget(self._cam_label1)
+        if self._camera_specs:
+            for label, index in self._camera_specs:
+                cam_label = QLabel(f"{label} (index {index})\n(not connected)")
+                cam_label.setAlignment(Qt.AlignCenter)
+                cam_label.setStyleSheet("background: #1a1a1a; color: #888;")
+                cam_label.setMinimumWidth(320)
+                cam_layout.addWidget(cam_label)
+                self._cam_labels[label] = cam_label
+        else:
+            placeholder = QLabel("No cameras configured")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet("background: #1a1a1a; color: #888;")
+            cam_layout.addWidget(placeholder)
 
         splitter.addWidget(cam_panel)
 
@@ -460,12 +475,14 @@ class AlignmentWindow(QMainWindow):
                 self._dps = Dps5005(serial_modbus, limits)
                 status_parts.append(f"DPS: {dps_port}")
 
-            cam0 = int(cfg.get("cam0_id", 0))
-            cam1 = int(cfg.get("cam1_id", 1))
             fps = float(cfg.get("cam_fps", 15))
-            self._cameras = CameraController(cam0_id=cam0, cam1_id=cam1, fps=fps)
-            self._cameras.start_preview()
-            status_parts.append(f"Cams {cam0}/{cam1} @ {fps} FPS")
+            if self._camera_specs:
+                self._cameras = CameraController(cameras=self._camera_specs, fps=fps)
+                self._cameras.start_preview()
+                cams_desc = ", ".join(f"{label}:{idx}" for label, idx in self._camera_specs)
+                status_parts.append(f"Cams: {cams_desc} @ {fps} FPS")
+            else:
+                status_parts.append("No cameras configured")
 
             self.statusBar().showMessage(" | ".join(status_parts))
         except Exception as exc:
@@ -478,8 +495,12 @@ class AlignmentWindow(QMainWindow):
         if self._dps is not None:
             try:
                 self._dps.onoff("w", 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Heater Error",
+                    f"Could not confirm the heater turned off: {exc}\n"
+                    "Check the DPS5005 manually before leaving.",
+                )
         if self._grbl is not None:
             try:
                 self._grbl.disconnect()
@@ -494,15 +515,14 @@ class AlignmentWindow(QMainWindow):
     def _poll_cameras(self) -> None:
         if self._cameras is None:
             return
-        f0, f1 = self._cameras.get_frames()
-        if f0 is not None:
-            self._cam_label0.setPixmap(self._ndarray_to_pixmap(f0))
-        elif self._cameras.cam0_error:
-            self._cam_label0.setText(f"Camera 0\n(error: {self._cameras.cam0_error})")
-        if f1 is not None:
-            self._cam_label1.setPixmap(self._ndarray_to_pixmap(f1))
-        elif self._cameras.cam1_error:
-            self._cam_label1.setText(f"Camera 1\n(error: {self._cameras.cam1_error})")
+        frames = self._cameras.get_frames()
+        errors = self._cameras.errors()
+        for label, cam_label in self._cam_labels.items():
+            frame = frames.get(label)
+            if frame is not None:
+                cam_label.setPixmap(self._ndarray_to_pixmap(frame))
+            elif errors.get(label):
+                cam_label.setText(f"{label}\n(error: {errors[label]})")
 
     @staticmethod
     def _ndarray_to_pixmap(frame: np.ndarray) -> QPixmap:
@@ -531,13 +551,16 @@ class AlignmentWindow(QMainWindow):
             fr = float(self._jog_fr.text() or 600)
         except ValueError:
             fr = 600.0
-        grbl._drain_buffer()
-        grbl._send_line("G91")
-        grbl._send_line(f"G1 F{fr:.1f}")
-        grbl._send_line(
-            f"G1 X{dx_sign * step:.3f} Y{dy_sign * step:.3f} Z{dz_sign * step:.3f}"
-        )
-        grbl._send_line("G90")
+        try:
+            grbl._drain_buffer()
+            grbl._send_line("G91")
+            grbl._send_line(f"G1 F{fr:.1f}")
+            grbl._send_line(
+                f"G1 X{dx_sign * step:.3f} Y{dy_sign * step:.3f} Z{dz_sign * step:.3f}"
+            )
+            grbl._send_line("G90")
+        except (TimeoutError, OSError) as exc:
+            QMessageBox.critical(self, "Jog Error", str(exc))
 
     def _goto(self) -> None:
         if self._grbl is None:
@@ -553,7 +576,10 @@ class AlignmentWindow(QMainWindow):
             fr = float(self._jog_fr.text() or 600)
         except ValueError:
             fr = 600.0
-        self._grbl.send_move(x, y, z, fr)
+        try:
+            self._grbl.send_move(x, y, z, fr)
+        except (TimeoutError, OSError) as exc:
+            QMessageBox.critical(self, "Go-to Error", str(exc))
 
     def _update_position(self) -> None:
         if self._grbl is None:
@@ -581,16 +607,33 @@ class AlignmentWindow(QMainWindow):
             QMessageBox.warning(self, "No DPS", "Heater (DPS5005) is not connected.")
             self._heat_btn.setChecked(False)
             return
-        self._dps.onoff("w", 1 if checked else 0)
+        try:
+            self._dps.onoff("w", 1 if checked else 0)
+        except IOError as exc:
+            QMessageBox.critical(self, "Heater Error", str(exc))
+            # The write never reached the DPS -- revert the button so it
+            # doesn't claim a state we couldn't actually confirm.
+            self._heat_btn.blockSignals(True)
+            self._heat_btn.setChecked(not checked)
+            self._heat_btn.blockSignals(False)
+            return
         self._heat_btn.setText("Turn OFF" if checked else "Turn ON")
 
     def _apply_voltage(self) -> None:
-        if self._dps is not None:
+        if self._dps is None:
+            return
+        try:
             self._dps.voltage_set("w", self._voltage_sb.value())
+        except IOError as exc:
+            QMessageBox.critical(self, "Heater Error", str(exc))
 
     def _apply_current(self) -> None:
-        if self._dps is not None:
+        if self._dps is None:
+            return
+        try:
             self._dps.current_set("w", self._current_sb.value())
+        except IOError as exc:
+            QMessageBox.critical(self, "Heater Error", str(exc))
 
     # ------------------------------------------------------------------
     #  Save / manage positions

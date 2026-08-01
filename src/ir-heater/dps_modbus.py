@@ -7,7 +7,14 @@ try:
 except ImportError:
 	import configparser as ConfigParser
 
-''' 
+# Modbus RTU over RS485 sees occasional transient frame errors; retry a few
+# times before giving up. Failures used to be caught and printed without
+# ever raising, so a dropped write (e.g. "turn heater off") could silently
+# do nothing while the rest of the program believed it had succeeded.
+_MODBUS_RETRIES = 3
+_MODBUS_RETRY_DELAY_S = 0.15
+
+'''
 import the system limit thresholds from the *.ini file.
 having a separate file allows simple modification for other versions of DPS supplies.
 these limits prevent the program from issuing silly values.
@@ -161,34 +168,44 @@ class Dps5005:
 		
 #---
 	def function(self, reg_addr=0, decimal_places=0, RWaction='r', value=0.0, max_value=0, min_value=0):
-		a = False
-		if value > max_value or value < min_value: 
+		if value > max_value or value < min_value:
 			value = 0.0
-		if RWaction != 'w':
+		last_exc = None
+		for attempt in range(_MODBUS_RETRIES):
 			try:
-				a = self.serial_data.read(reg_addr, decimal_places)
-			except IOError:
-				print("Failed to read from instrument")
-		else:
-			try:
-				self.serial_data.write(reg_addr, value, decimal_places) # register, value, No_of_decimal_places
-			except IOError:
-				print("Failed to write to instrument")
-		return(a)
-	
+				if RWaction != 'w':
+					return self.serial_data.read(reg_addr, decimal_places)
+				else:
+					self.serial_data.write(reg_addr, value, decimal_places) # register, value, No_of_decimal_places
+					return True
+			except IOError as exc:
+				last_exc = exc
+				if attempt + 1 < _MODBUS_RETRIES:
+					time.sleep(_MODBUS_RETRY_DELAY_S)
+		action = "read from" if RWaction != 'w' else "write to"
+		raise IOError(
+			f"Failed to {action} instrument (register {reg_addr:#x}) "
+			f"after {_MODBUS_RETRIES} attempts"
+		) from last_exc
+
 	def functions(self, reg_addr=0, num_of_addr=0, RWaction='r', value=0):
-		a = False
-		if RWaction != 'w':
+		last_exc = None
+		for attempt in range(_MODBUS_RETRIES):
 			try:
-				a = self.serial_data.read_block(reg_addr, num_of_addr)
-			except IOError:
-				print("Failed to read block from instrument")
-		else:
-			try:
-				self.serial_data.write_block(reg_addr, value)
-			except IOError:
-				print("Failed to write block to instrument")
-		return(a)
+				if RWaction != 'w':
+					return self.serial_data.read_block(reg_addr, num_of_addr)
+				else:
+					self.serial_data.write_block(reg_addr, value)
+					return True
+			except IOError as exc:
+				last_exc = exc
+				if attempt + 1 < _MODBUS_RETRIES:
+					time.sleep(_MODBUS_RETRY_DELAY_S)
+		action = "read block from" if RWaction != 'w' else "write block to"
+		raise IOError(
+			f"Failed to {action} instrument (register {reg_addr:#x}) "
+			f"after {_MODBUS_RETRIES} attempts"
+		) from last_exc
 	
 	def delay(self, value):
 		global time_old

@@ -1,14 +1,19 @@
 # IR Heater Sequence Runner
 
 Synchronized control of a **GRBL-based CNC gantry** and a **DPS5005 power supply**
-for automated IR heating experiments.  Includes dual-camera recording, visual
+for automated IR heating experiments.  Includes multi-camera recording, visual
 pattern generation, and a manual alignment/jog interface.
 
 ## Hardware
 
 - **GRBL controller** (Acmer laser cutter or any GRBL 1.1 gantry) via raw serial
-- **DPS5005** programmable DC supply via Modbus RTU (for the IR heater)
-- **Two USB cameras** (optional) for recording and alignment preview
+- **DPS5005** programmable DC supply via Modbus RTU (for the IR heater) —
+  writes (voltage/current/on-off) retry a few times on transient RS485
+  errors, then raise instead of failing silently, so a dropped "turn heater
+  off" can no longer go unnoticed
+- **Any number of USB cameras** (optional) for recording and alignment preview —
+  identified by live preview and assigned a label, since OS device indices
+  aren't stable across reconnects (see [Identifying cameras](#identifying-cameras))
 
 > **⚠️ Important: Do NOT use homing (`$H`).**  The homing cycle is
 > deliberately disabled in this software.  Running `$H` manually (e.g. via a
@@ -40,12 +45,23 @@ output directory (or current directory for dry-runs).  It records:
 - Run ID, start/end timestamps (UTC), total duration
 - CSV file, loop count, time mode, feedrate
 - All hardware ports, baud rates, work-area limits
-- Camera IDs, FPS, recording file paths (`.mp4`)
+- Cameras used (`{label: device_index}`), FPS, recording file paths per label (`.mp4`)
 - Total steps vs. steps completed, any error message
+- `drift_warnings`: any motion-drift warnings raised during the run (see
+  [Motion-drift verification](#motion-drift-verification))
 
 Camera recording runs in a **separate process** (`CameraRecorderProcess`) so that
 disk I/O from video encoding never blocks the timing-critical gcode loop.  The
 main sequence thread handles only GRBL serial, DPS Modbus, and sleep-based timing.
+
+Every recorded `.mp4` gets a matching `<same name>_frames.csv` sidecar logging
+the wall-clock UTC timestamp of every written frame. `VideoWriter` assumes a
+constant frame rate; if real capture ever dips below the target FPS (USB
+contention between multiple cameras, CPU load), the video's internal timeline
+silently drifts from wall-clock time. The sidecar gives an exact, independent
+record for mapping any frame back to real time — and back to the position/
+heater state at that moment via `metadata.started_utc` — without relying on
+`frame_index / fps`.
 
 ## Project Structure
 
@@ -56,7 +72,8 @@ src/ir-heater/
 ├── sequence_runner.py           # Core: CSV -> GRBL + DPS + cameras
 ├── sequence_generator.py        # Old: A<->B oscillation generator
 ├── pattern_generator.py         # Heat-location dwell-pattern generator (circle/rectangle/line)
-├── camera_controller.py         # Dual USB capture + process-isolated recording
+├── camera_controller.py         # Multi-camera capture + process-isolated recording
+├── camera_setup_dialog.py       # Live-preview camera identification/labeling dialog (PySide6)
 ├── dps_modbus.py                # DPS5005 Modbus driver
 ├── dps5005_limits.ini           # DPS voltage/current safety limits
 ├── gui.py                       # Main sequence-runner GUI (PySide6)
@@ -75,7 +92,7 @@ uv run main.py run \
     --modbus-port COM4 \
     --grbl-port COM3 \
     --loops 3 \
-    --cam0 0 --cam1 1 --cam-fps 15 --record-dir ./capture
+    --camera top:0 --camera side:1 --cam-fps 15 --record-dir ./capture
 ```
 
 | Option | Default | Description |
@@ -91,7 +108,8 @@ uv run main.py run \
 | `--grbl-port` | — | GRBL serial port, or `auto` to probe all ports for a GRBL controller |
 | `--grbl-baud` | `115200` | GRBL baud rate |
 | `--x-max`, `--y-max`, `--z-max` | — | Software work-area clamps (mm) |
-| `--cam0`, `--cam1` | — | USB camera device IDs |
+| `--camera LABEL:INDEX` | — | Add a camera for recording (repeatable — any number of cameras) |
+| `--list-cameras` | — | Probe device indices 0-9 for a responsive camera and exit |
 | `--cam-fps` | `15` | Recording framerate |
 | `--record-dir` | — | Output directory for `.mp4` files and `run_metadata_*.json` |
 | `--return-to-first-position` | off | Return to first CSV position instead of origin |
@@ -117,7 +135,8 @@ uv run main.py pattern-gen \
     --locations heat_locations.csv \
     --output sequence.csv \
     --travel-feedrate 2000 \
-    --spiral-turns 3          # circle-shape only
+    --ring-spacing-mm 2 \      # circle-shape only
+    --start-x 0 --start-y 0 --start-z 0   # optional: known gantry start position
 ```
 
 Input locations CSV columns:
@@ -127,15 +146,29 @@ Input locations CSV columns:
 | `x`, `y`, `z` | Centre of the heated region (mm) |
 | `dwell_time_s` | How long to dwell at this location |
 | `radius_mm` | Radius (circle), half-width (rect), or half-length (line) |
-| `dwell_feedrate` | Slow feedrate during dwell (mm/min) — separate from travel speed |
 | `voltage_v`, `current_a` | Heater setpoints |
 | `shape` *(optional)* | `circle` (default), `rectangle`, or `line` |
 | `width_mm` *(optional)* | Full width for rectangle; full length for line |
 | `height_mm` *(optional)* | Full height for rectangle (ignored for line) |
 | `label` *(optional)* | Human-readable name |
 
+There is deliberately no `dwell_feedrate` column — the in-location dwell speed
+is *derived* from the dwell path length and `dwell_time_s`
+(`path_mm * 60 / dwell_time_s`), not taken as a separate input. An earlier
+version accepted both independently, which meant they could silently
+disagree: the commanded feedrate might not actually cover the path within
+the scheduled time, so the software's timing model and the gantry's real
+position could drift apart — exactly the kind of inconsistency this project
+depends on avoiding. `--travel-feedrate` (between locations) is unaffected.
+
+`--start-x`/`--start-y`/`--start-z` (all three or none) tell the generator
+where the gantry actually is when the sequence starts, so the very first
+move gets a real travel time instead of a fixed 0.5s guess. Without them,
+the generator prints a warning and falls back to the guess.
+
 Dwell patterns by shape:
-- **circle** — Archimedean spiral from centre → radius → back
+- **circle** — concentric rings traced with native GRBL `G2`/`G3` arcs (see
+  [Arc moves](#arc-moves-g2g3) below), spaced `--ring-spacing-mm` apart
 - **rectangle** — Zigzag raster fill of the rectangle area
 - **line** — Straight line traversed back and forth
 
@@ -149,7 +182,8 @@ uv run main.py gui
 
 Load a pairs CSV, configure hardware, run sequences with live matplotlib plots
 and optional camera recording.  Writes `run_metadata_*.json` alongside
-recordings.
+recordings. Click **Configure Cameras…** to identify and label however many
+cameras you want to record from (see [Identifying cameras](#identifying-cameras)).
 
 ### `align` — Manual alignment & jog window
 
@@ -157,7 +191,8 @@ recordings.
 uv run main.py align
 ```
 
-- Live dual-camera preview (zero-copy `QImage` from OpenCV frames)
+- Live preview for however many cameras you configure in the connect dialog
+  (zero-copy `QImage` from OpenCV frames)
 - Jog pad: X+ / X- / Y+ / Y- / Z+ / Z- with configurable step size and feedrate
 - Go-to coordinate input
 - GRBL position polling (every 500 ms)
@@ -189,6 +224,8 @@ Required columns (flexible aliases supported):
 | `y` | — |
 | `z` | — |
 | `feedrate` *(optional)* | `speed`, `f` |
+| `arc_i`, `arc_j` *(optional)* | — |
+| `arc_dir` *(optional)* | — |
 
 Example:
 
@@ -198,6 +235,23 @@ time,current,voltage,x,y,z,feedrate
 2.0,1.5,14.0,20,10,1,1400
 1.0,1.0,10.0,20,20,1,1200
 ```
+
+### Arc moves (G2/G3)
+
+A row is an ordinary linear move (`G1`) unless both `arc_i` and `arc_j` are
+given, in which case it becomes a circular arc (`G2` clockwise by default, or
+`G3` if `arc_dir` is `ccw`) — GRBL's native circular interpolation, computed
+exactly in firmware rather than approximated with short straight segments.
+`arc_i`/`arc_j` follow GRBL's own convention: the offset from the *row's
+starting point* (i.e. the previous row's `x`/`y`) to the arc's center — not
+a bare `i`/`j`, since `i` already aliases the `current` column above and a
+column named just `i` would be ambiguous. `pattern-gen`'s circle shape is
+the main producer of these rows (see `_ring_segments` in
+`pattern_generator.py`); hand-written CSVs can use them directly too. Arc
+rows are **not** clamped to `--x-max`/`--y-max`/`--z-max` — clamping only the
+endpoint would leave the center offset pointing somewhere that no longer
+matches a circle through the (now-clamped) start and end points, so an
+out-of-bounds arc is rejected up front with a clear error instead.
 
 ## Dependencies
 
@@ -225,6 +279,34 @@ pillow>=12.1.1         # Image support
   unlocked.  Since homing is disabled, `GrblController` clears this lock with
   `$X` right after connecting (this does **not** move the gantry — it just
   tells GRBL to trust the current step position).
+- Every command sent to GRBL (`_send_line`) has a bounded 10s timeout and
+  raises `TimeoutError` instead of blocking forever if a reply never
+  arrives (e.g. a dropped byte on a flaky link). The `align` GUI's jog/go-to
+  buttons call GRBL directly on the main Qt thread, so an unbounded wait
+  there used to freeze the entire window until the process was killed.
+
+## Motion-drift verification
+
+There's no real closed loop here — GRBL only tracks its own commanded step
+position, no independent (e.g. encoder) feedback exists, and `run_sequence`'s
+timing is fundamentally wall-clock/open-loop: a G-code line's `ok` reply just
+means GRBL *accepted* it into its planner buffer, not that the motion
+finished. Polling GRBL's status and waiting for `Idle` before every move
+would give hard guarantees, but it would also force a full stop-and-decelerate
+at every waypoint — for the fine-grained dwell patterns that means killing
+the smooth continuous motion they're built for (and could unevenly heat
+whatever dwells longer at each forced stop).
+
+Instead, `run_sequence` periodically (every `_DRIFT_CHECK_INTERVAL_S` = 5s of
+wall-clock time, **not** every step, so it can't affect motion smoothness)
+samples GRBL's real position (`?` status query) and compares how far it
+actually moved against how far the schedule expected it to move in that same
+window. If the gantry covered less than half (`_DRIFT_WARN_FRACTION`) of the
+scheduled distance, it prints a `WARNING: motion drift` message and appends
+it to `metadata.drift_warnings` in the run's JSON log — e.g. a sign that a
+dwell's implied speed is more than the hardware can actually sustain. This
+never gates or slows the command stream; it's a verification/alerting layer
+on top of the existing open-loop timing, not a synchronization mechanism.
 
 ## Connecting to custom GRBL boards (e.g. ACMER)
 
@@ -250,3 +332,27 @@ Both `gui` and `align` have **Refresh Ports** / **Auto-detect GRBL** buttons
 next to the port fields that do the same thing. Auto-detect only sends the
 same reset/handshake bytes used to connect (never G-code), so probing a
 non-GRBL device (e.g. the DPS heater) is harmless.
+
+## Identifying cameras
+
+USB webcams don't have a stable identity in OpenCV — the OS can assign a
+camera a different device index across reboots or reconnects, and generic
+webcams all report the same unhelpful description ("USB Video Device"), so
+there's no metadata to tell them apart by. The only reliable way to know
+which physical camera is which is to look at it.
+
+Both `gui` and `align` have a **Configure Cameras…** button that opens a
+live-preview picker: it probes device indices 0-9, shows a thumbnail from
+each one that responds, and lets you check off however many you want to use
+(zero, one, two, or more) and give each a label (e.g. `top`, `side`). Camera
+identity is tracked by that label everywhere downstream — recording
+filenames, `run_metadata_*.json`, and the alignment preview panels — not by
+the raw index, so a re-identify after a reconnect doesn't require touching
+anything else.
+
+On the CLI, use repeatable `--camera LABEL:INDEX` flags:
+
+```bash
+uv run main.py run --list-cameras                        # which indices respond
+uv run main.py run --camera top:0 --camera side:1 ...     # record from both
+```

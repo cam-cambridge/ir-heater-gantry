@@ -270,13 +270,14 @@ class PatternUtilityWindow(QMainWindow):
         self._dwell_size_stack = size_stack
         dwell_form.addRow("", size_stack)
 
+        feedrate_hint = QLabel("Dwell feedrate is computed automatically from path length ÷ time.")
+        feedrate_hint.setStyleSheet("color: #888; font-style: italic;")
+        feedrate_hint.setWordWrap(True)
+        dwell_form.addRow("", feedrate_hint)
+
         m_row = QHBoxLayout()
-        self._dwell_fr = QLineEdit("200")
-        self._dwell_fr.setMaximumWidth(55)
         self._dwell_z = QLineEdit("0")
         self._dwell_z.setMaximumWidth(55)
-        m_row.addWidget(QLabel("Feedrate:"))
-        m_row.addWidget(self._dwell_fr)
         m_row.addWidget(QLabel("Z (mm):"))
         m_row.addWidget(self._dwell_z)
         m_row.addStretch()
@@ -463,7 +464,6 @@ class PatternUtilityWindow(QMainWindow):
         try:
             dwell_time = float(self._dwell_time.text())
             radius = float(self._dwell_radius.text())
-            dwell_fr = float(self._dwell_fr.text())
             z_val = float(self._dwell_z.text())
             voltage = float(self._dwell_v.text())
             current = float(self._dwell_i.text())
@@ -484,7 +484,7 @@ class PatternUtilityWindow(QMainWindow):
             writer = csv.writer(f)
             writer.writerow([
                 "label", "x", "y", "z", "dwell_time_s", "radius_mm",
-                "dwell_feedrate", "voltage_v", "current_a",
+                "voltage_v", "current_a",
                 "shape", "width_mm", "height_mm",
             ])
             for i, (x, y, lbl) in enumerate(all_points):
@@ -492,7 +492,7 @@ class PatternUtilityWindow(QMainWindow):
                     lbl or f"pt_{i + 1}",
                     f"{x:.3f}", f"{y:.3f}", f"{z_val:.3f}",
                     f"{dwell_time:.1f}", f"{radius:.1f}",
-                    f"{dwell_fr:.0f}", f"{voltage:.2f}", f"{current:.2f}",
+                    f"{voltage:.2f}", f"{current:.2f}",
                     shape, width_mm, height_mm,
                 ])
 

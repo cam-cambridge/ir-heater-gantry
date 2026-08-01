@@ -4,9 +4,12 @@ Instead of the old back-and-forth between fixed position pairs, this module
 works with *heat locations*:
 
 - Each location has a **center** point, a **dwell time**, and a **radius**.
-- Within the radius the gantry traces a slow spiral pattern (at a low
-  *dwell feedrate*) so the IR heater covers the entire circular area
-  uniformly.
+- Within the radius the gantry traces concentric rings (native GRBL G2/G3
+  arcs) so the IR heater covers the entire circular area uniformly, with far
+  fewer G-code lines and mechanically exact circles compared to approximating
+  a spiral out of short straight segments. The dwell feedrate is *derived*
+  from the path length and the dwell time, not set independently -- see
+  ``generate_dwell_rows`` for why that matters.
 
 Output is a ``sequence.csv`` compatible with ``sequence_runner.py``.
 
@@ -29,6 +32,13 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class Position:
+    x: float
+    y: float
+    z: float
+
+
+@dataclass(frozen=True)
 class HeatLocation:
     """One region to heat on the gantry bed — circle, rectangle, or line."""
 
@@ -37,7 +47,6 @@ class HeatLocation:
     z: float          # Z height (mm)
     dwell_time_s: float      # how long to spend dwelling at this location
     radius_mm: float         # radius (circle), half-width (rect), or half-length (line)
-    dwell_feedrate: float    # feedrate during dwell (mm/min, slow)
     voltage_v: float
     current_a: float
     label: str = ""          # optional human-readable name
@@ -57,6 +66,23 @@ class SequenceRow:
     y: float
     z: float
     feedrate: float
+    # Arc move (G2/G3): center offset from the *previous* row's position.
+    # None on both = ordinary linear move (G1).
+    arc_i: float | None = None
+    arc_j: float | None = None
+    arc_cw: bool = True
+
+
+@dataclass(frozen=True)
+class _PathSegment:
+    """One leg of a dwell path -- either linear or an arc, with its true length."""
+
+    x: float
+    y: float
+    length_mm: float
+    arc_i: float | None = None
+    arc_j: float | None = None
+    arc_cw: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -154,60 +180,74 @@ def _line_points(
 
 
 # ---------------------------------------------------------------------------
-#  Spiral dwell-pattern generation
+#  Ring (G2/G3 arc) dwell-pattern generation
 # ---------------------------------------------------------------------------
 
-def _spiral_points(
-    cx: float,
-    cy: float,
-    radius: float,
-    turns: int = 3,
-    segments_per_turn: int = 24,
-) -> list[tuple[float, float]]:
-    """Generate (x, y) points tracing an Archimedean spiral from centre outward.
+def _ring_segments(cx: float, cy: float, radius: float, ring_spacing_mm: float) -> list[_PathSegment]:
+    """Concentric-ring coverage path from centre out to *radius*.
 
-    Parameters
-    ----------
-    cx, cy:
-        Spiral centre.
-    radius:
-        Maximum radius (mm).
-    turns:
-        Number of full revolutions.
-    segments_per_turn:
-        How many line-segments per revolution (higher = smoother circle).
+    Steps out from the centre to the innermost ring, traces it as two G3
+    (CCW) semicircle arcs -- GRBL's native circular interpolation, computed
+    exactly in firmware -- steps out to the next ring, and so on. Compared to
+    approximating a spiral with many short straight segments, this needs far
+    fewer G-code lines (less serial overhead, less drift risk) and traces
+    mechanically exact circles instead of a polygon approximation.
+
+    Rings are spaced roughly *ring_spacing_mm* apart, evenly dividing
+    [0, radius] so the outermost ring always lands exactly on *radius*.
     """
-    total_segments = turns * segments_per_turn
-    points: list[tuple[float, float]] = [(cx, cy)]  # start at centre
-    for i in range(1, total_segments + 1):
-        frac = i / total_segments                # 0 → 1
-        theta = 2.0 * math.pi * turns * frac     # angle
-        r = radius * frac                        # linearly growing radius
-        x = cx + r * math.cos(theta)
-        y = cy + r * math.sin(theta)
-        points.append((x, y))
-    return points
+    if radius <= 0:
+        return []
+    num_rings = max(1, round(radius / ring_spacing_mm))
+    radii = [radius * (k + 1) / num_rings for k in range(num_rings)]
+
+    segments: list[_PathSegment] = []
+    prev_x, prev_y = cx, cy  # start at centre
+    for r in radii:
+        start_x, start_y = cx + r, cy
+        step_dist = math.hypot(start_x - prev_x, start_y - prev_y)
+        if step_dist > 1e-9:
+            segments.append(_PathSegment(x=start_x, y=start_y, length_mm=step_dist))
+
+        mid_x, mid_y = cx - r, cy
+        circumference_half = math.pi * r
+        segments.append(_PathSegment(
+            x=mid_x, y=mid_y, length_mm=circumference_half,
+            arc_i=cx - start_x, arc_j=cy - start_y, arc_cw=False,
+        ))
+        segments.append(_PathSegment(
+            x=start_x, y=start_y, length_mm=circumference_half,
+            arc_i=cx - mid_x, arc_j=cy - mid_y, arc_cw=False,
+        ))
+        prev_x, prev_y = start_x, start_y
+    return segments
 
 
-def _points_distance(points: list[tuple[float, float]]) -> float:
-    """Total path length (mm) along a sequence of points."""
-    total = 0.0
+def _linear_segments(points: list[tuple[float, float]]) -> list[_PathSegment]:
+    """Convert a plain (x, y) waypoint path into straight-line ``_PathSegment``s."""
+    segments: list[_PathSegment] = []
     for i in range(1, len(points)):
-        dx = points[i][0] - points[i - 1][0]
-        dy = points[i][1] - points[i - 1][1]
-        total += math.sqrt(dx * dx + dy * dy)
-    return total
+        x0, y0 = points[i - 1]
+        x1, y1 = points[i]
+        segments.append(_PathSegment(x=x1, y=y1, length_mm=math.hypot(x1 - x0, y1 - y0)))
+    return segments
 
 
-def generate_dwell_rows(loc: HeatLocation, spiral_turns: int = 3) -> list[SequenceRow]:
+def generate_dwell_rows(loc: HeatLocation, ring_spacing_mm: float = 2.0) -> list[SequenceRow]:
     """Create the slow dwell pattern for a single ``HeatLocation``.
 
-    For ``shape == "circle"``: an Archimedean spiral out-and-back.
+    For ``shape == "circle"``: concentric G2/G3 ring arcs (see ``_ring_segments``).
     For ``shape == "rectangle"``: a zigzag raster fill of the rectangle.
     For ``shape == "line"``: a straight line traversed back and forth.
 
-    In both cases the ``dwell_feedrate`` (slow) is used for every segment;
-    travel between locations uses a separate, faster ``travel_feedrate``.
+    The feedrate for every segment is *derived* from the total dwell path
+    length and ``dwell_time_s`` (``total_dist_mm * 60 / dwell_time_s``)
+    rather than taken as a separate input. This keeps the commanded speed
+    and the wall-clock schedule mathematically consistent by construction --
+    an earlier version accepted an independent ``dwell_feedrate`` value that
+    could silently disagree with what ``dwell_time_s`` implied, causing the
+    gantry's actual position to drift away from what the timing loop (and
+    therefore the DPS voltage/current schedule) assumed.
     """
     if loc.dwell_time_s <= 0:
         return []
@@ -218,32 +258,28 @@ def generate_dwell_rows(loc: HeatLocation, spiral_turns: int = 3) -> list[Sequen
         if w <= 0 or h <= 0:
             return []
         passes = max(3, int(h / 2.0))  # ~2 mm line spacing
-        path = _raster_points(loc.x, loc.y, w, h, passes=passes)
+        segments = _linear_segments(_raster_points(loc.x, loc.y, w, h, passes=passes))
     elif loc.shape == "line":
         length = loc.width_mm if loc.width_mm > 0 else loc.radius_mm * 2.0
         if length <= 0:
             return []
         passes = max(2, int(loc.dwell_time_s / 2.0))
-        path = _line_points(loc.x, loc.y, length, passes=passes)
+        segments = _linear_segments(_line_points(loc.x, loc.y, length, passes=passes))
     else:
-        # Default: circle spiral
-        outward = _spiral_points(loc.x, loc.y, loc.radius_mm, turns=spiral_turns)
-        inward_points = _spiral_points(loc.x, loc.y, loc.radius_mm, turns=spiral_turns)
-        inward = list(reversed(inward_points))
-        path = outward[:-1] + inward
+        segments = _ring_segments(loc.x, loc.y, loc.radius_mm, ring_spacing_mm=ring_spacing_mm)
 
-    # Total path length
-    total_dist = _points_distance(path)
+    total_dist = sum(seg.length_mm for seg in segments)
     if total_dist <= 0:
         return []
 
+    # Derive the feedrate that covers the whole path in exactly
+    # dwell_time_s, so every segment's time_s (proportional to its share of
+    # total_dist) and its commanded speed agree by construction.
+    dwell_feedrate = total_dist * 60.0 / loc.dwell_time_s
+
     rows: list[SequenceRow] = []
-    for i in range(1, len(path)):
-        dx = path[i][0] - path[i - 1][0]
-        dy = path[i][1] - path[i - 1][1]
-        seg_dist = math.sqrt(dx * dx + dy * dy)
-        # Time for this segment
-        seg_time = (seg_dist / total_dist) * loc.dwell_time_s
+    for seg in segments:
+        seg_time = (seg.length_mm / total_dist) * loc.dwell_time_s
         if seg_time < 0.001:
             continue
         rows.append(
@@ -251,10 +287,13 @@ def generate_dwell_rows(loc: HeatLocation, spiral_turns: int = 3) -> list[Sequen
                 time_s=seg_time,
                 current_a=loc.current_a,
                 voltage_v=loc.voltage_v,
-                x=path[i][0],
-                y=path[i][1],
+                x=seg.x,
+                y=seg.y,
                 z=loc.z,
-                feedrate=loc.dwell_feedrate,
+                feedrate=dwell_feedrate,
+                arc_i=seg.arc_i,
+                arc_j=seg.arc_j,
+                arc_cw=seg.arc_cw,
             )
         )
 
@@ -268,7 +307,8 @@ def generate_dwell_rows(loc: HeatLocation, spiral_turns: int = 3) -> list[Sequen
 def generate_heat_sequence(
     locations: list[HeatLocation],
     travel_feedrate: float = 2000.0,
-    spiral_turns: int = 3,
+    ring_spacing_mm: float = 2.0,
+    start_position: Position | None = None,
 ) -> list[SequenceRow]:
     """Build a full sequence: travel to each location, dwell, repeat.
 
@@ -278,47 +318,56 @@ def generate_heat_sequence(
         Ordered list of heat locations.
     travel_feedrate:
         Feedrate (mm/min) to use when moving *between* locations (fast).
-    spiral_turns:
-        Number of spiral revolutions within each dwell radius.
+    ring_spacing_mm:
+        Approximate radial spacing between concentric dwell rings for
+        circle-shape locations (smaller = more rings = denser coverage).
+    start_position:
+        Gantry position when the sequence starts, if known (e.g. read off
+        the alignment GUI beforehand). Used to compute a real travel time
+        for the very first move. If omitted, the first move falls back to a
+        fixed 0.5s regardless of actual distance -- fine if the gantry is
+        already near location 1, wrong (and silently so) otherwise, so a
+        warning is printed when this fallback is used.
     """
     rows: list[SequenceRow] = []
-    prev: HeatLocation | None = None
+    prev_position: Position | None = start_position
 
     for loc in locations:
-        # --- Travel from previous location to this one (fast) ---
-        if prev is not None:
-            dx = loc.x - prev.x
-            dy = loc.y - prev.y
-            dz = loc.z - prev.z
+        # --- Travel from the previous position to this one (fast) ---
+        if prev_position is not None:
+            dx = loc.x - prev_position.x
+            dy = loc.y - prev_position.y
+            dz = loc.z - prev_position.z
             dist = math.sqrt(dx * dx + dy * dy + dz * dz)
             if dist > 0.001:
                 travel_time = dist * 60.0 / travel_feedrate
-                rows.append(
-                    SequenceRow(
-                        time_s=travel_time,
-                        current_a=loc.current_a,
-                        voltage_v=loc.voltage_v,
-                        x=loc.x,
-                        y=loc.y,
-                        z=loc.z,
-                        feedrate=travel_feedrate,
-                    )
-                )
             else:
                 # Zero-distance — still add a tiny step to set V/I
-                rows.append(
-                    SequenceRow(
-                        time_s=0.1,
-                        current_a=loc.current_a,
-                        voltage_v=loc.voltage_v,
-                        x=loc.x,
-                        y=loc.y,
-                        z=loc.z,
-                        feedrate=travel_feedrate,
-                    )
+                travel_time = 0.1
+            rows.append(
+                SequenceRow(
+                    time_s=travel_time,
+                    current_a=loc.current_a,
+                    voltage_v=loc.voltage_v,
+                    x=loc.x,
+                    y=loc.y,
+                    z=loc.z,
+                    feedrate=travel_feedrate,
                 )
+            )
         else:
-            # First location: move to it
+            # First location and no start_position given: distance is
+            # genuinely unknown, so we can't compute a real travel time.
+            # This is a fixed guess, not a measurement -- if location 1 is
+            # actually far from the gantry's current position, the DPS
+            # voltage/current for it will be commanded well before the
+            # gantry physically arrives. Pass start_position to fix this.
+            print(
+                "WARNING: no start_position given -- first move to "
+                f"({loc.x:.1f}, {loc.y:.1f}, {loc.z:.1f}) uses a fixed 0.5s "
+                "guess regardless of actual distance.",
+                flush=True,
+            )
             rows.append(
                 SequenceRow(
                     time_s=0.5,
@@ -331,11 +380,19 @@ def generate_heat_sequence(
                 )
             )
 
-        # --- Dwell spiral at this location ---
-        dwell_rows = generate_dwell_rows(loc, spiral_turns=spiral_turns)
+        # --- Dwell pattern at this location ---
+        dwell_rows = generate_dwell_rows(loc, ring_spacing_mm=ring_spacing_mm)
         rows.extend(dwell_rows)
 
-        prev = loc
+        # Dwell patterns don't necessarily end back at the location's centre
+        # (raster ends at a corner, line depends on pass count, and ring arcs
+        # end at the outer ring's edge) -- use the real last position so the
+        # next location's travel distance/time is computed correctly.
+        if dwell_rows:
+            last = dwell_rows[-1]
+            prev_position = Position(last.x, last.y, last.z)
+        else:
+            prev_position = Position(loc.x, loc.y, loc.z)
 
     return rows
 
@@ -347,8 +404,13 @@ def generate_heat_sequence(
 def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
     """Parse a CSV of heat locations.
 
-    Required columns: ``x, y, z, dwell_time_s, radius_mm, dwell_feedrate, voltage_v, current_a``
+    Required columns: ``x, y, z, dwell_time_s, radius_mm, voltage_v, current_a``
     Optional column: ``label``
+
+    There is deliberately no ``dwell_feedrate`` column -- the dwell speed is
+    derived from the path length and ``dwell_time_s`` (see
+    ``generate_dwell_rows``) so the commanded speed and the schedule can
+    never disagree.
     """
     if not csv_path.exists():
         raise ValueError(f"Heat locations CSV not found: {csv_path}")
@@ -360,8 +422,7 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
             raise ValueError("CSV is empty or missing header")
 
         fields = {n.strip().lower() for n in reader.fieldnames if n}
-        required = {"x", "y", "z", "dwell_time_s", "radius_mm",
-                     "dwell_feedrate", "voltage_v", "current_a"}
+        required = {"x", "y", "z", "dwell_time_s", "radius_mm", "voltage_v", "current_a"}
         missing = required - fields
         if missing:
             raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
@@ -376,7 +437,6 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
                     z=float(row.get("z", 0) or 0),
                     dwell_time_s=float(row.get("dwell_time_s", 0) or 0),
                     radius_mm=float(row.get("radius_mm", 0) or 0),
-                    dwell_feedrate=float(row.get("dwell_feedrate", 0) or 0),
                     voltage_v=float(row.get("voltage_v", 0) or 0),
                     current_a=float(row.get("current_a", 0) or 0),
                     label=(row.get("label") or "").strip(),
@@ -394,11 +454,18 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
 
 
 def write_sequence_csv(rows: list[SequenceRow], output_csv: Path) -> None:
-    """Write a sequence CSV readable by ``sequence_runner.read_sequence_csv``."""
+    """Write a sequence CSV readable by ``sequence_runner.read_sequence_csv``.
+
+    ``arc_i``/``arc_j``/``arc_dir`` are left blank for ordinary linear moves
+    and only populated for G2/G3 arc rows (see ``_ring_segments``).
+    """
     with output_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["time", "current", "voltage", "x", "y", "z", "feedrate"])
+        writer.writerow(
+            ["time", "current", "voltage", "x", "y", "z", "feedrate", "arc_i", "arc_j", "arc_dir"]
+        )
         for row in rows:
+            is_arc = row.arc_i is not None and row.arc_j is not None
             writer.writerow([
                 f"{row.time_s:.6f}",
                 f"{row.current_a:.6f}",
@@ -407,6 +474,9 @@ def write_sequence_csv(rows: list[SequenceRow], output_csv: Path) -> None:
                 f"{row.y:.6f}",
                 f"{row.z:.6f}",
                 f"{row.feedrate:.6f}",
+                f"{row.arc_i:.6f}" if is_arc else "",
+                f"{row.arc_j:.6f}" if is_arc else "",
+                ("cw" if row.arc_cw else "ccw") if is_arc else "",
             ])
 
 
@@ -420,23 +490,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--locations", type=Path, required=True,
-        help="CSV of heat locations (x,y,z,dwell_time_s,radius_mm,dwell_feedrate,voltage_v,current_a)",
+        help="CSV of heat locations (x,y,z,dwell_time_s,radius_mm,voltage_v,current_a)",
     )
     parser.add_argument("--output", type=Path, default=Path("sequence.csv"))
     parser.add_argument("--travel-feedrate", type=float, default=2000.0,
                         help="Feedrate between locations (mm/min)")
-    parser.add_argument("--spiral-turns", type=int, default=3,
-                        help="Spiral revolutions within each dwell radius")
+    parser.add_argument("--ring-spacing-mm", type=float, default=2.0,
+                        help="Radial spacing between concentric dwell rings (circle shape only)")
+    parser.add_argument(
+        "--start-x", type=float, default=None,
+        help="Gantry's known X position when the sequence starts (e.g. from the "
+             "alignment GUI) -- lets the first move's timing be computed for real "
+             "instead of a fixed 0.5s guess. Must be given with --start-y/--start-z.",
+    )
+    parser.add_argument("--start-y", type=float, default=None, help="See --start-x")
+    parser.add_argument("--start-z", type=float, default=None, help="See --start-x")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     locations = read_heat_locations_csv(args.locations)
+
+    start_coords = (args.start_x, args.start_y, args.start_z)
+    if any(c is not None for c in start_coords) and not all(c is not None for c in start_coords):
+        raise SystemExit("error: --start-x/--start-y/--start-z must be given together")
+    start_position = Position(*start_coords) if all(c is not None for c in start_coords) else None
+
     rows = generate_heat_sequence(
         locations,
         travel_feedrate=args.travel_feedrate,
-        spiral_turns=args.spiral_turns,
+        ring_spacing_mm=args.ring_spacing_mm,
+        start_position=start_position,
     )
     write_sequence_csv(rows, args.output)
     print(f"Wrote {len(rows)} sequence rows to {args.output}")
