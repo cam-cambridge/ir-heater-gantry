@@ -54,7 +54,7 @@ if str(_SR_DIR) not in sys.path:
 
 from camera_controller import CameraController
 from dps_modbus import Dps5005, Import_limits, Serial_modbus
-from sequence_runner import GrblController
+from sequence_runner import GrblController, find_grbl_port, list_serial_ports
 
 # ---------------------------------------------------------------------------
 #  Constants
@@ -81,11 +81,23 @@ class ConnectDialog(QDialog):
         # --- GRBL ---
         grbl_gb = QGroupBox("GRBL Controller")
         grbl_form = QFormLayout(grbl_gb)
-        self._grbl_port = QLineEdit()
+        self._grbl_port = QComboBox()
+        self._grbl_port.setEditable(True)
         self._grbl_baud = QLineEdit(str(_DEFAULT_BAUD))
         self._grbl_baud.setMaximumWidth(80)
         grbl_form.addRow("Port:", self._grbl_port)
         grbl_form.addRow("Baud:", self._grbl_baud)
+
+        grbl_btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh Ports")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        grbl_btn_row.addWidget(refresh_btn)
+        auto_btn = QPushButton("Auto-detect GRBL")
+        auto_btn.setToolTip("Probe every serial port for a GRBL welcome banner")
+        auto_btn.clicked.connect(self._auto_detect_grbl)
+        grbl_btn_row.addWidget(auto_btn)
+        grbl_form.addRow("", grbl_btn_row)
+
         layout.addWidget(grbl_gb)
 
         # --- Work area ---
@@ -105,7 +117,8 @@ class ConnectDialog(QDialog):
         # --- DPS ---
         dps_gb = QGroupBox("Heater (DPS5005)")
         dps_form = QFormLayout(dps_gb)
-        self._dps_port = QLineEdit()
+        self._dps_port = QComboBox()
+        self._dps_port.setEditable(True)
         self._dps_addr = QLineEdit("1")
         self._dps_addr.setMaximumWidth(60)
         self._dps_baud = QLineEdit("9600")
@@ -143,15 +156,41 @@ class ConnectDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._result: dict[str, str] = {}
+        self._refresh_ports()
+
+    def _refresh_ports(self) -> None:
+        """Re-scan available serial ports and repopulate both port combos.
+
+        Item text is the bare device name (e.g. ``COM3``) so it can be used
+        directly as a port argument; the human-readable description is
+        attached as a tooltip instead of being folded into the text.
+        """
+        ports = list_serial_ports()
+        for combo in (self._grbl_port, self._dps_port):
+            current = combo.currentText().strip()
+            combo.clear()
+            for device, desc in ports:
+                combo.addItem(device)
+                combo.setItemData(combo.count() - 1, desc, Qt.ToolTipRole)
+            combo.setCurrentText(current)
+
+    def _auto_detect_grbl(self) -> None:
+        dps_port = self._dps_port.currentText().strip()
+        exclude = {dps_port} if dps_port else None
+        port = find_grbl_port(exclude=exclude)
+        if port is None:
+            QMessageBox.warning(self, "Auto-detect", "No GRBL controller found on any serial port.")
+            return
+        self._grbl_port.setCurrentText(port)
 
     def _on_connect(self) -> None:
         self._result = {
-            "grbl_port": self._grbl_port.text().strip(),
+            "grbl_port": self._grbl_port.currentText().strip(),
             "grbl_baud": self._grbl_baud.text().strip(),
             "x_max": self._x_max.text().strip(),
             "y_max": self._y_max.text().strip(),
             "z_max": self._z_max.text().strip(),
-            "dps_port": self._dps_port.text().strip(),
+            "dps_port": self._dps_port.currentText().strip(),
             "dps_addr": self._dps_addr.text().strip(),
             "dps_baud": self._dps_baud.text().strip(),
             "cam0_id": self._cam0_id.text().strip(),

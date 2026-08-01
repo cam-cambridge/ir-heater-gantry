@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -55,6 +55,8 @@ from sequence_runner import (
     GrblController,
     RunMetadata,
     SequenceStep,
+    find_grbl_port,
+    list_serial_ports,
     read_sequence_csv,
     run_sequence,
 )
@@ -217,6 +219,7 @@ class MainWindow(QMainWindow):
         self._total_steps = 1
 
         self._build_ui()
+        self._refresh_ports()
 
         # Progress poll timer
         self._poll_timer = QTimer(self)
@@ -255,10 +258,10 @@ class MainWindow(QMainWindow):
 
         # Modbus
         conn_layout.addWidget(QLabel("Modbus:"))
-        self._modbus_port_le = QLineEdit()
-        self._modbus_port_le.setMaximumWidth(80)
-        self._modbus_port_le.setPlaceholderText("COM4")
-        conn_layout.addWidget(self._modbus_port_le)
+        self._modbus_port_cb = QComboBox()
+        self._modbus_port_cb.setEditable(True)
+        self._modbus_port_cb.setMinimumWidth(100)
+        conn_layout.addWidget(self._modbus_port_cb)
         conn_layout.addWidget(QLabel("Addr:"))
         self._modbus_addr_le = QLineEdit("1")
         self._modbus_addr_le.setMaximumWidth(40)
@@ -270,14 +273,24 @@ class MainWindow(QMainWindow):
 
         conn_layout.addSpacing(12)
         conn_layout.addWidget(QLabel("GRBL:"))
-        self._grbl_port_le = QLineEdit()
-        self._grbl_port_le.setMaximumWidth(80)
-        self._grbl_port_le.setPlaceholderText("COM3")
-        conn_layout.addWidget(self._grbl_port_le)
+        self._grbl_port_cb = QComboBox()
+        self._grbl_port_cb.setEditable(True)
+        self._grbl_port_cb.setMinimumWidth(100)
+        conn_layout.addWidget(self._grbl_port_cb)
         conn_layout.addWidget(QLabel("Baud:"))
         self._grbl_baud_le = QLineEdit("115200")
         self._grbl_baud_le.setMaximumWidth(60)
         conn_layout.addWidget(self._grbl_baud_le)
+
+        refresh_ports_btn = QPushButton("Refresh Ports")
+        refresh_ports_btn.setToolTip("Re-scan available serial ports")
+        refresh_ports_btn.clicked.connect(self._refresh_ports)
+        conn_layout.addWidget(refresh_ports_btn)
+
+        auto_grbl_btn = QPushButton("Auto-detect GRBL")
+        auto_grbl_btn.setToolTip("Probe every serial port for a GRBL welcome banner")
+        auto_grbl_btn.clicked.connect(self._auto_detect_grbl)
+        conn_layout.addWidget(auto_grbl_btn)
 
         conn_layout.addStretch()
         ctrl_layout.addWidget(conn_gb)
@@ -403,6 +416,39 @@ class MainWindow(QMainWindow):
         root.addWidget(self._canvas, 1)
 
     # ------------------------------------------------------------------
+    #  Serial port selection
+    # ------------------------------------------------------------------
+
+    def _refresh_ports(self) -> None:
+        """Re-scan available serial ports and repopulate both port combos.
+
+        Item text is the bare device name (e.g. ``COM3``) so it can be used
+        directly as a port argument; the human-readable description is
+        attached as a tooltip instead of being folded into the text.
+        """
+        ports = list_serial_ports()
+        for combo in (self._modbus_port_cb, self._grbl_port_cb):
+            current = combo.currentText().strip()
+            combo.clear()
+            for device, desc in ports:
+                combo.addItem(device)
+                combo.setItemData(combo.count() - 1, desc, Qt.ToolTipRole)
+            combo.setCurrentText(current)
+
+    def _auto_detect_grbl(self) -> None:
+        self._status_label.setText("Probing ports for GRBL…")
+        QApplication.processEvents()
+        modbus_port = self._modbus_port_cb.currentText().strip()
+        exclude = {modbus_port} if modbus_port else None
+        port = find_grbl_port(exclude=exclude)
+        if port is None:
+            self._status_label.setText("Ready")
+            QMessageBox.warning(self, "Auto-detect", "No GRBL controller found on any serial port.")
+            return
+        self._grbl_port_cb.setCurrentText(port)
+        self._status_label.setText(f"Found GRBL on {port}")
+
+    # ------------------------------------------------------------------
     #  CSV loading
     # ------------------------------------------------------------------
 
@@ -507,7 +553,7 @@ class MainWindow(QMainWindow):
             return
 
         dry_run = self._dry_run_cb.isChecked()
-        if not dry_run and not self._modbus_port_le.text().strip():
+        if not dry_run and not self._modbus_port_cb.currentText().strip():
             QMessageBox.critical(self, "Missing port",
                                  "Modbus port is required when not using dry run.")
             return
@@ -528,10 +574,10 @@ class MainWindow(QMainWindow):
             time_mode=self._time_mode_cb.currentText(),
             dry_run=self._dry_run_cb.isChecked(),
             return_to_origin=self._return_cb.isChecked(),
-            modbus_port=self._modbus_port_le.text().strip(),
+            modbus_port=self._modbus_port_cb.currentText().strip(),
             modbus_addr=int(self._modbus_addr_le.text() or 1),
             modbus_baud=int(self._modbus_baud_le.text() or 9600),
-            grbl_port=self._grbl_port_le.text().strip(),
+            grbl_port=self._grbl_port_cb.currentText().strip(),
             grbl_baud=int(self._grbl_baud_le.text() or 115200),
             x_max=_parse_optional_float(self._x_max_le.text()),
             y_max=_parse_optional_float(self._y_max_le.text()),

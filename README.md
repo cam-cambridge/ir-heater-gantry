@@ -88,13 +88,14 @@ uv run main.py run \
 | `--modbus-port` | — | DPS serial port (COM4, /dev/ttyUSB0) |
 | `--modbus-address` | `1` | DPS Modbus address |
 | `--modbus-baud` | `9600` | DPS baud rate |
-| `--grbl-port` | — | GRBL serial port |
+| `--grbl-port` | — | GRBL serial port, or `auto` to probe all ports for a GRBL controller |
 | `--grbl-baud` | `115200` | GRBL baud rate |
 | `--x-max`, `--y-max`, `--z-max` | — | Software work-area clamps (mm) |
 | `--cam0`, `--cam1` | — | USB camera device IDs |
 | `--cam-fps` | `15` | Recording framerate |
 | `--record-dir` | — | Output directory for `.mp4` files and `run_metadata_*.json` |
 | `--return-to-first-position` | off | Return to first CSV position instead of origin |
+| `--list-ports` | — | List available serial ports (device + description) and exit |
 
 ### `generate` — Old A<->B oscillation generator
 
@@ -219,3 +220,33 @@ pillow>=12.1.1         # Image support
   are sent
 - Homing (`$H`) is **deliberately disabled** — do not attempt to home the
   gantry.  See the warning in the Hardware section above.
+- If hard/soft limits are configured on the controller, GRBL boots into an
+  **Alarm** state on every reset and rejects motion (`error:9`) until
+  unlocked.  Since homing is disabled, `GrblController` clears this lock with
+  `$X` right after connecting (this does **not** move the gantry — it just
+  tells GRBL to trust the current step position).
+
+## Connecting to custom GRBL boards (e.g. ACMER)
+
+Some laser/CNC controllers (ACMER's included) run a customized GRBL fork on a
+non-Arduino MCU that doesn't reset when the serial port opens and may not
+print the standard `Grbl ...` banner. `GrblController`'s connect handshake
+copes with this automatically:
+
+1. Waits for a banner; if none appears, sends a GRBL soft-reset (`Ctrl-X`) to
+   force one.
+2. If the banner text doesn't contain `Grbl`, falls back to confirming the
+   device via a live status query (`?`) before giving up.
+3. Clears a power-up Alarm lock with `$X` (see above) — never `$H`.
+
+**Finding the right COM port:**
+
+```bash
+uv run main.py run --list-ports          # list every visible serial port
+uv run main.py run --grbl-port auto ...  # probe all ports for a GRBL banner
+```
+
+Both `gui` and `align` have **Refresh Ports** / **Auto-detect GRBL** buttons
+next to the port fields that do the same thing. Auto-detect only sends the
+same reset/handshake bytes used to connect (never G-code), so probing a
+non-GRBL device (e.g. the DPS heater) is harmless.

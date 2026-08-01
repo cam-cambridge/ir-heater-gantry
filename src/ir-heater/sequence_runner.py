@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import serial as pyserial
+from serial.tools import list_ports as _list_ports
 
 from camera_controller import CameraController, CameraRecorderProcess
 from dps_modbus import Dps5005, Import_limits, Serial_modbus
@@ -191,16 +192,68 @@ def expand_loop_steps(steps: list[SequenceStep], loops: int) -> list[SequenceSte
     return steps * loops
 
 
+def list_serial_ports() -> list[tuple[str, str]]:
+    """Return ``(device, description)`` for every serial port visible to the OS."""
+    return [(p.device, p.description or p.device) for p in _list_ports.comports()]
+
+
+def find_grbl_port(
+    baudrate: int = 115200,
+    timeout_s: float = 2.5,
+    exclude: set[str] | None = None,
+) -> str | None:
+    """Probe every serial port for a GRBL welcome banner; return the first match.
+
+    Only sends the same reset/handshake bytes ``GrblController`` uses to
+    connect (never G-code), so probing a non-GRBL device is harmless.  Used
+    by ``--grbl-port auto`` and the GUI "Auto-detect" buttons.
+    """
+    exclude = exclude or set()
+    for device, _desc in list_serial_ports():
+        if device in exclude:
+            continue
+        try:
+            probe = pyserial.Serial(device, baudrate, timeout=0.5)
+        except (OSError, pyserial.SerialException):
+            continue
+        try:
+            time.sleep(0.3)
+            probe.reset_input_buffer()
+            probe.write(b"\x18")  # GRBL soft-reset -- forces a fresh banner
+            deadline = time.time() + timeout_s
+            banner = b""
+            while time.time() < deadline:
+                waiting = probe.in_waiting
+                if waiting:
+                    banner += probe.read(waiting)
+                    if b"grbl" in banner.lower():
+                        return device
+                time.sleep(0.1)
+        except (OSError, pyserial.SerialException):
+            continue
+        finally:
+            probe.close()
+    return None
+
+
 class GrblController:
     """Communicates with a GRBL-based CNC/laser controller via raw serial.
 
     GRBL's protocol is simple: send a G-code line terminated with ``\\n``,
     then read back ``ok`` or ``error:N``.  No line numbers, no checksums.
 
+    Many CNC/laser boards (e.g. ACMER's) run a customized GRBL fork on a
+    non-Arduino MCU that doesn't reset when the serial port is opened, and
+    some alter the welcome-banner text.  The connect handshake below copes
+    with both: it forces a GRBL soft-reset if no banner shows up on its own,
+    and falls back to a live status query if the banner text doesn't match
+    the standard ``Grbl`` string.
+
     Parameters
     ----------
     serial_port:
-        e.g. ``COM3`` on Windows or ``/dev/ttyUSB0`` on Linux.
+        e.g. ``COM3`` on Windows or ``/dev/ttyUSB0`` on Linux.  Pass
+        ``"auto"`` to probe all visible ports for a GRBL device.
     baudrate:
         GRBL default is 115200 (not 250000 like Marlin).
     connect_timeout_s:
@@ -225,25 +278,46 @@ class GrblController:
         y_max: float | None = None,
         z_max: float | None = None,
     ):
+        if serial_port.strip().lower() == "auto":
+            detected = find_grbl_port(baudrate)
+            if detected is None:
+                raise RuntimeError(
+                    "Auto-detect: no GRBL controller found on any serial port."
+                )
+            serial_port = detected
+
         self._serial = pyserial.Serial(serial_port, baudrate, timeout=1.0)
-        self._serial.write(b"\r\n\r\n")
-        time.sleep(0.5)
+        # Give any hardware auto-reset (DTR toggle on Arduino-style boards)
+        # time to finish booting before we start reading.
+        time.sleep(2.0)
+        self._drain_buffer()
 
-        # Read welcome banner ("Grbl 1.1f ['$' for help]\r\n")
-        deadline = time.time() + connect_timeout_s
-        banner = b""
-        while time.time() < deadline:
-            waiting = self._serial.in_waiting
-            if waiting:
-                banner += self._serial.read(waiting)
-                if b"Grbl" in banner:
-                    break
-            time.sleep(0.1)
+        banner = self._read_banner(connect_timeout_s)
+        if not banner:
+            # Boards without an auto-reset circuit (common on non-Arduino
+            # MCUs like the ones ACMER uses) stay running silently on
+            # port-open and never print a fresh banner on their own.  Force
+            # one with a GRBL soft-reset.
+            self._serial.write(b"\x18")
+            time.sleep(0.5)
+            banner = self._read_banner(connect_timeout_s)
 
-        if b"Grbl" not in banner:
+        if banner and b"grbl" not in banner.lower():
+            # Got *something* back, just not the standard "Grbl" banner text
+            # (some custom forks rename it).  Confirm it's really GRBL by
+            # checking it answers the real-time status query.
+            self._serial.timeout = 0.5
+            if not self._read_status_report():
+                self._serial.close()
+                raise RuntimeError(
+                    f"Unexpected response on {serial_port} (not GRBL?). "
+                    f"Received: {banner!r}"
+                )
+
+        if not banner:
             self._serial.close()
             raise RuntimeError(
-                f"GRBL not detected on {serial_port}.  Received: {banner!r}"
+                f"GRBL not detected on {serial_port}.  No response to soft-reset."
             )
 
         self._serial.timeout = 0.5
@@ -252,7 +326,42 @@ class GrblController:
         self._y_max = y_max
         self._z_max = z_max
 
-        print(f"Connected to {banner.decode().strip()}", flush=True)
+        print(f"Connected to {banner.decode(errors='replace').strip()}", flush=True)
+
+        # GRBL boots into ALARM state on every reset whenever hard/soft
+        # limits are configured, and refuses all motion commands
+        # (``error:9``) until unlocked.  Homing ($H) is deliberately never
+        # sent by this software (see class docstring warning), so clear the
+        # lock directly instead -- this does NOT move the gantry, it just
+        # tells GRBL to trust the current step position.
+        status = self._read_status_report()
+        if "Alarm" in status:
+            print("GRBL booted in Alarm state; clearing lock with $X (no homing)...", flush=True)
+            unlock_resp = self._send_line("$X")
+            print(f"Unlock response: {unlock_resp}", flush=True)
+
+    def _read_banner(self, timeout_s: float) -> bytes:
+        """Read whatever text GRBL sends after a reset, up to *timeout_s*."""
+        deadline = time.time() + timeout_s
+        banner = b""
+        while time.time() < deadline:
+            waiting = self._serial.in_waiting
+            if waiting:
+                banner += self._serial.read(waiting)
+                if b"grbl" in banner.lower():
+                    break
+            time.sleep(0.1)
+        return banner
+
+    def _read_status_report(self, timeout_s: float = 1.0) -> str:
+        """Poll GRBL's real-time status (``?``) and return the ``<...>`` line."""
+        self._serial.write(b"?")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            line = self._serial.readline().decode(errors="replace").strip()
+            if line.startswith("<"):
+                return line
+        return ""
 
     # ------------------------------------------------------------------
     def _drain_buffer(self) -> None:
@@ -296,8 +405,7 @@ class GrblController:
 
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
-        self._serial.write(b"?\n")
-        return self._serial.readline().decode(errors="replace").strip()
+        return self._read_status_report(timeout_s=0.5)
 
     def soft_reset(self) -> None:
         """Send Ctrl-X (0x18) to soft-reset GRBL."""
@@ -477,7 +585,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run synchronized printer + DPS control from a CSV schedule."
     )
-    parser.add_argument("--csv", type=Path, required=True, help="Input schedule CSV path")
+    parser.add_argument("--csv", type=Path, default=None, help="Input schedule CSV path")
+    parser.add_argument(
+        "--list-ports", action="store_true",
+        help="List available serial ports and exit",
+    )
     parser.add_argument(
         "--loops",
         type=int,
@@ -507,7 +619,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to DPS limits ini",
     )
 
-    parser.add_argument("--grbl-port", default="", help="GRBL controller serial port (e.g. COM3)")
+    parser.add_argument(
+        "--grbl-port", default="",
+        help="GRBL controller serial port (e.g. COM3), or 'auto' to probe all ports",
+    )
     parser.add_argument("--grbl-baud", type=int, default=115200, help="GRBL serial baud rate")
     parser.add_argument(
         "--x-max", type=float, default=None,
@@ -556,6 +671,14 @@ def _stdin_stop_listener(stop_event: threading.Event) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    if args.list_ports:
+        for device, description in list_serial_ports():
+            print(f"{device}\t{description}")
+        return
+
+    if args.csv is None:
+        raise SystemExit("error: --csv is required (unless --list-ports)")
 
     steps = read_sequence_csv(args.csv, default_feedrate=args.default_feedrate)
     looped_steps = expand_loop_steps(steps, args.loops)
