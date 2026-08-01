@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
+import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +40,36 @@ _DEFAULT_MIN_FPS = 0.1
 _DEFAULT_CAM0_ID = 0
 _DEFAULT_CAM1_ID = 1
 _DEFAULT_FPS = 15.0
+
+
+def _open_capture(cam_id: int, attempts: int = 3, retry_delay: float = 0.4) -> cv2.VideoCapture:
+    """Open a camera, working around Windows' unreliable auto-selected backend.
+
+    ``cv2.VideoCapture(id)`` on Windows defaults to Media Foundation (MSMF),
+    which intermittently reports ``isOpened() == False`` for UVC webcams that
+    other apps (e.g. the Windows Camera app, which talks to MF directly, not
+    through OpenCV) can open fine. DirectShow (``CAP_DSHOW``) is far more
+    reliable for this case, so try it first on Windows, then fall back to
+    OpenCV's default backend selection. A short retry loop also helps with
+    cameras that need a moment to become available after being released by
+    another application.
+    """
+    backends = [cv2.CAP_DSHOW] if sys.platform == "win32" else []
+    cap: cv2.VideoCapture | None = None
+    for backend in backends:
+        for _ in range(attempts):
+            cap = cv2.VideoCapture(cam_id, backend)
+            if cap.isOpened():
+                return cap
+            cap.release()
+            time.sleep(retry_delay)
+    for _ in range(attempts):
+        cap = cv2.VideoCapture(cam_id)
+        if cap.isOpened():
+            return cap
+        cap.release()
+        time.sleep(retry_delay)
+    return cap
 
 
 def _load_camera_config(config_path: Path | None = None) -> dict[str, str]:
@@ -68,12 +100,14 @@ class _CameraThread:
         fourcc: str = _DEFAULT_FOURCC,
         min_fps: float = _DEFAULT_MIN_FPS,
         join_timeout: float = _DEFAULT_JOIN_TIMEOUT,
+        on_error: Callable[[str, str], None] | None = None,
     ) -> None:
         self._id = cam_id
         self._fps = fps
         self._label = label
         self._fourcc = fourcc
         self._join_timeout = join_timeout
+        self._on_error = on_error
         self._cap: cv2.VideoCapture | None = None
         self._lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
@@ -81,17 +115,29 @@ class _CameraThread:
         self._thread: threading.Thread | None = None
         self._writer: cv2.VideoWriter | None = None
         self._frame_interval = 1.0 / max(fps, min_fps)
+        self._error: str | None = None
 
     # ------------------------------------------------------------------
     def _open(self) -> None:
-        self._cap = cv2.VideoCapture(self._id)
+        self._cap = _open_capture(self._id)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera {self._id} ({self._label})")
         # Try to set requested FPS (best-effort; many USB cameras ignore this)
         self._cap.set(_CV2_CAP_PROP_FPS, self._fps)
 
     def _loop(self) -> None:
-        self._open()
+        try:
+            self._open()
+        except Exception as exc:
+            # Report the failure instead of letting it kill this daemon
+            # thread silently -- an uncaught exception here previously left
+            # the camera looking permanently "not connected" with no clue
+            # why (see _open_capture docstring for the common Windows cause).
+            self._error = str(exc)
+            if self._on_error is not None:
+                self._on_error(self._label, self._error)
+            return
+
         last_write = 0.0
         try:
             while self._running:
@@ -127,6 +173,10 @@ class _CameraThread:
         with self._lock:
             return self._latest_frame.copy() if self._latest_frame is not None else None
 
+    @property
+    def error(self) -> str | None:
+        return self._error
+
     # --- Recording -------------------------------------------------------
 
     def start_writer(self, output_dir: Path, fourcc: str | None = None) -> Path:
@@ -136,7 +186,8 @@ class _CameraThread:
         """
         frame = self.get_frame()
         if frame is None:
-            raise RuntimeError(f"No frame available from camera {self._id}")
+            detail = f": {self._error}" if self._error else ""
+            raise RuntimeError(f"No frame available from camera {self._id}{detail}")
 
         timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
         fname = f"cam{self._id}_{timestamp}.mp4"
@@ -180,6 +231,7 @@ class CameraController:
         cam1_id: int = _DEFAULT_CAM1_ID,
         fps: float = _DEFAULT_FPS,
         config_path: Path | None = None,
+        on_error: Callable[[str, str], None] | None = None,
     ) -> None:
         cfg = _load_camera_config(config_path)
         fourcc = cfg.get("fourcc", _DEFAULT_FOURCC)
@@ -187,9 +239,11 @@ class CameraController:
         join_timeout = float(cfg.get("join_timeout", _DEFAULT_JOIN_TIMEOUT))
 
         self._cam0 = _CameraThread(cam0_id, fps, "cam0", fourcc=fourcc,
-                                   min_fps=min_fps, join_timeout=join_timeout)
+                                   min_fps=min_fps, join_timeout=join_timeout,
+                                   on_error=on_error)
         self._cam1 = _CameraThread(cam1_id, fps, "cam1", fourcc=fourcc,
-                                   min_fps=min_fps, join_timeout=join_timeout)
+                                   min_fps=min_fps, join_timeout=join_timeout,
+                                   on_error=on_error)
         self._fps = fps
         self._recording = False
         self._record_dir: Path | None = None
@@ -273,6 +327,14 @@ class CameraController:
     def cam1_id(self) -> int:
         return self._cam1._id
 
+    @property
+    def cam0_error(self) -> str | None:
+        return self._cam0.error
+
+    @property
+    def cam1_error(self) -> str | None:
+        return self._cam1.error
+
     # ------------------------------------------------------------------
     #  Snapshots
     # ------------------------------------------------------------------
@@ -341,7 +403,7 @@ class CameraRecorderProcess(multiprocessing.Process):
         try:
             # --- Open cameras ---
             for cam_id in (self._cam0_id, self._cam1_id):
-                cap = cv2.VideoCapture(cam_id)
+                cap = _open_capture(cam_id)
                 if not cap.isOpened():
                     self._result_queue.put(("error", f"Cannot open camera {cam_id}"))
                     return

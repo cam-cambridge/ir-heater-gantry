@@ -497,8 +497,12 @@ class AlignmentWindow(QMainWindow):
         f0, f1 = self._cameras.get_frames()
         if f0 is not None:
             self._cam_label0.setPixmap(self._ndarray_to_pixmap(f0))
+        elif self._cameras.cam0_error:
+            self._cam_label0.setText(f"Camera 0\n(error: {self._cameras.cam0_error})")
         if f1 is not None:
             self._cam_label1.setPixmap(self._ndarray_to_pixmap(f1))
+        elif self._cameras.cam1_error:
+            self._cam_label1.setText(f"Camera 1\n(error: {self._cameras.cam1_error})")
 
     @staticmethod
     def _ndarray_to_pixmap(frame: np.ndarray) -> QPixmap:
