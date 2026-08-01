@@ -10,6 +10,12 @@ pattern generation, and a manual alignment/jog interface.
 - **DPS5005** programmable DC supply via Modbus RTU (for the IR heater)
 - **Two USB cameras** (optional) for recording and alignment preview
 
+> **⚠️ Important: Do NOT use homing (`$H`).**  The homing cycle is
+> deliberately disabled in this software.  Running `$H` manually (e.g. via a
+> serial terminal) may crash the gantry into its mechanical limits if end-stop
+> switches are not properly configured or absent.  Always jog the gantry to a
+> known-safe position manually before starting a sequence.
+
 ## Quick Start
 
 ```bash
@@ -85,7 +91,6 @@ uv run main.py run \
 | `--grbl-port` | — | GRBL serial port |
 | `--grbl-baud` | `115200` | GRBL baud rate |
 | `--x-max`, `--y-max`, `--z-max` | — | Software work-area clamps (mm) |
-| `--home-on-connect` | off | Run `$H` homing cycle on connect |
 | `--cam0`, `--cam1` | — | USB camera device IDs |
 | `--cam-fps` | `15` | Recording framerate |
 | `--record-dir` | — | Output directory for `.mp4` files and `run_metadata_*.json` |
@@ -212,5 +217,5 @@ pillow>=12.1.1         # Image support
   `--x-max` / `--y-max` / `--z-max` CLI flags
 - The laser is **not** used — only the motion system. No `M3`/`M4`/`M5` commands
   are sent
-- Homing: use `$H` via `--home-on-connect` or the Home button in the
-  alignment GUI
+- Homing (`$H`) is **deliberately disabled** — do not attempt to home the
+  gantry.  See the warning in the Hardware section above.

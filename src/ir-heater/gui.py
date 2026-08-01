@@ -101,7 +101,6 @@ class _SequenceWorker(QThread):
         x_max: float | None,
         y_max: float | None,
         z_max: float | None,
-        home_on_connect: bool,
         record_cameras: bool,
         cam0_id: int,
         cam1_id: int,
@@ -122,7 +121,6 @@ class _SequenceWorker(QThread):
         self._x_max = x_max
         self._y_max = y_max
         self._z_max = z_max
-        self._home_on_connect = home_on_connect
         self._record_cameras = record_cameras
         self._cam0_id = cam0_id
         self._cam1_id = cam1_id
@@ -151,7 +149,6 @@ class _SequenceWorker(QThread):
                         x_max=self._x_max,
                         y_max=self._y_max,
                         z_max=self._z_max,
-                        home_on_connect=self._home_on_connect,
                     )
 
             if self._record_cameras and self._record_dir:
@@ -173,7 +170,6 @@ class _SequenceWorker(QThread):
                 x_max=self._x_max,
                 y_max=self._y_max,
                 z_max=self._z_max,
-                home_on_connect=self._home_on_connect,
                 dps_port=self._modbus_port,
                 dps_address=self._modbus_addr,
                 dps_baud=self._modbus_baud,
@@ -301,8 +297,6 @@ class MainWindow(QMainWindow):
         self._z_max_le = QLineEdit()
         self._z_max_le.setMaximumWidth(50)
         area_layout.addWidget(self._z_max_le)
-        self._home_cb = QCheckBox("Home ($H) on connect")
-        area_layout.addWidget(self._home_cb)
         area_layout.addStretch()
         ctrl_layout.addWidget(area_gb)
 
@@ -542,7 +536,6 @@ class MainWindow(QMainWindow):
             x_max=_parse_optional_float(self._x_max_le.text()),
             y_max=_parse_optional_float(self._y_max_le.text()),
             z_max=_parse_optional_float(self._z_max_le.text()),
-            home_on_connect=self._home_cb.isChecked(),
             record_cameras=self._record_cb.isChecked(),
             cam0_id=cam0,
             cam1_id=cam1,

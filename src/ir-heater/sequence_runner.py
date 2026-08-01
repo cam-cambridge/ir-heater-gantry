@@ -53,7 +53,6 @@ class RunMetadata:
     x_max: float | None = None
     y_max: float | None = None
     z_max: float | None = None
-    home_on_connect: bool = False
     dps_port: str = ""
     dps_address: int = 1
     dps_baud: int = 9600
@@ -210,8 +209,11 @@ class GrblController:
         Optional software-side work-area limits in mm.  Coordinates sent
         via ``send_move`` are clamped to these ranges.  Pass ``None`` to
         skip clamping (rely on GRBL's own ``$130``-``$132`` soft-limits).
-    home_on_connect:
-        If ``True``, run ``$H`` homing cycle immediately after connecting.
+
+        .. warning::
+            Homing (``$H``) is **deliberately not supported**.  Do not
+            send ``$H`` to the controller — it may crash the gantry into
+            its limits if end-stop switches are not configured correctly.
     """
 
     def __init__(
@@ -222,7 +224,6 @@ class GrblController:
         x_max: float | None = None,
         y_max: float | None = None,
         z_max: float | None = None,
-        home_on_connect: bool = False,
     ):
         self._serial = pyserial.Serial(serial_port, baudrate, timeout=1.0)
         self._serial.write(b"\r\n\r\n")
@@ -252,10 +253,6 @@ class GrblController:
         self._z_max = z_max
 
         print(f"Connected to {banner.decode().strip()}", flush=True)
-
-        if home_on_connect:
-            print("Homing ($H) …", flush=True)
-            self.home()
 
     # ------------------------------------------------------------------
     def _drain_buffer(self) -> None:
@@ -296,11 +293,6 @@ class GrblController:
         resp2 = self._send_line(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f}")
         if "error" in resp2:
             print(f"GRBL error on move: {resp2}", flush=True)
-
-    def home(self) -> None:
-        """Run the GRBL homing cycle (``$H``).  Blocks until complete."""
-        resp = self._send_line("$H")
-        print(f"Home response: {resp}", flush=True)
 
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
@@ -530,11 +522,6 @@ def parse_args() -> argparse.Namespace:
         help="Work-area Z maximum in mm (software clamp; omit to use GRBL soft-limits)",
     )
     parser.add_argument(
-        "--home-on-connect", action="store_true", default=False,
-        help="Run $H homing cycle immediately after connecting to GRBL",
-    )
-
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Parse and print schedule without sending commands to hardware",
@@ -593,7 +580,6 @@ def main() -> None:
             x_max=args.x_max,
             y_max=args.y_max,
             z_max=args.z_max,
-            home_on_connect=args.home_on_connect,
         )
         if args.grbl_port.strip()
         else None
@@ -621,7 +607,6 @@ def main() -> None:
         x_max=args.x_max,
         y_max=args.y_max,
         z_max=args.z_max,
-        home_on_connect=args.home_on_connect,
         dps_port=args.modbus_port,
         dps_address=args.modbus_address,
         dps_baud=args.modbus_baud,

@@ -84,10 +84,8 @@ class ConnectDialog(QDialog):
         self._grbl_port = QLineEdit()
         self._grbl_baud = QLineEdit(str(_DEFAULT_BAUD))
         self._grbl_baud.setMaximumWidth(80)
-        self._home_cb = QCheckBox("Home on connect ($H)")
         grbl_form.addRow("Port:", self._grbl_port)
         grbl_form.addRow("Baud:", self._grbl_baud)
-        grbl_form.addRow("", self._home_cb)
         layout.addWidget(grbl_gb)
 
         # --- Work area ---
@@ -150,7 +148,6 @@ class ConnectDialog(QDialog):
         self._result = {
             "grbl_port": self._grbl_port.text().strip(),
             "grbl_baud": self._grbl_baud.text().strip(),
-            "home": "1" if self._home_cb.isChecked() else "",
             "x_max": self._x_max.text().strip(),
             "y_max": self._y_max.text().strip(),
             "z_max": self._z_max.text().strip(),
@@ -268,10 +265,6 @@ class AlignmentWindow(QMainWindow):
 
         dpad.addWidget(_btn("Y+", 0, 1, 0), 0, 1)
         dpad.addWidget(_btn("X-", -1, 0, 0), 1, 0)
-        home_btn = QPushButton("Home")
-        home_btn.setFixedSize(64, 36)
-        home_btn.clicked.connect(self._home)
-        dpad.addWidget(home_btn, 1, 1)
         dpad.addWidget(_btn("X+", 1, 0, 0), 1, 2)
         dpad.addWidget(_btn("Y-", 0, -1, 0), 2, 1)
         dpad.addWidget(_btn("Z+", 0, 0, 1), 3, 0)
@@ -412,7 +405,6 @@ class AlignmentWindow(QMainWindow):
                     x_max=self._parse_opt_float(cfg.get("x_max", "")),
                     y_max=self._parse_opt_float(cfg.get("y_max", "")),
                     z_max=self._parse_opt_float(cfg.get("z_max", "")),
-                    home_on_connect=bool(cfg.get("home", "")),
                 )
                 status_parts.append(f"GRBL: {grbl_port}")
             else:
@@ -503,14 +495,6 @@ class AlignmentWindow(QMainWindow):
             f"G1 X{dx_sign * step:.3f} Y{dy_sign * step:.3f} Z{dz_sign * step:.3f}"
         )
         grbl._send_line("G90")
-
-    def _home(self) -> None:
-        if self._grbl is None:
-            return
-        try:
-            self._grbl.home()
-        except Exception as exc:
-            QMessageBox.critical(self, "Home Error", str(exc))
 
     def _goto(self) -> None:
         if self._grbl is None:
