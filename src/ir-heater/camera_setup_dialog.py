@@ -53,6 +53,12 @@ class _ProbeSlot(QGroupBox):
         super().__init__(f"Index {index}", parent)
         self.index = index
         self._cap: cv2.VideoCapture | None = cap
+        # Some UVC cameras need several read() calls before the sensor
+        # starts producing valid frames.  Discard those here so the
+        # first QTimer-triggered poll already sees a live image.
+        if self._cap is not None:
+            for _ in range(10):
+                self._cap.read()
 
         layout = QVBoxLayout(self)
         self._img_label = QLabel("(waiting for frame…)")
@@ -71,9 +77,14 @@ class _ProbeSlot(QGroupBox):
     def update_frame(self) -> None:
         if self._cap is None:
             return
-        ok, frame = self._cap.read()
-        if ok and frame is not None:
-            self._img_label.setPixmap(_ndarray_to_pixmap(frame))
+        # Try a few reads in case the camera needs a moment to produce a
+        # valid frame (common on first poll for UVC cameras with slow
+        # auto-exposure / AGC startup).
+        for _ in range(3):
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                self._img_label.setPixmap(_ndarray_to_pixmap(frame))
+                return
 
     def release(self) -> None:
         if self._cap is not None:

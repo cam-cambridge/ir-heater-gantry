@@ -237,6 +237,12 @@ def find_grbl_port(
     for device, _desc in list_serial_ports():
         if device in exclude:
             continue
+        # On Linux, /dev/ttyS* are motherboard 16550 UARTs — GRBL
+        # controllers always connect via USB-serial (/dev/ttyUSB* or
+        # /dev/ttyACM*).  Skipping them saves ~16 s on machines that
+        # expose dozens of unused onboard ports.
+        if sys.platform == "linux" and device.startswith("/dev/ttyS"):
+            continue
         try:
             probe = pyserial.Serial(device, baudrate, timeout=0.5)
         except (OSError, pyserial.SerialException):
@@ -360,9 +366,19 @@ class GrblController:
         # sent by this software (see class docstring warning), so clear the
         # lock directly instead -- this does NOT move the gantry, it just
         # tells GRBL to trust the current step position.
+        self._clear_alarm()
+
+    def _clear_alarm(self) -> None:
+        """Clear an Alarm lock with ``$X`` if GRBL is currently in one.
+
+        Does **not** home (see class docstring) -- just tells GRBL to trust
+        wherever it currently thinks it is.  Called after connecting and
+        after every ``soft_reset()``, since a reset re-triggers the same
+        Alarm lock whenever hard/soft limits are configured.
+        """
         status = self._read_status_report()
         if "Alarm" in status:
-            print("GRBL booted in Alarm state; clearing lock with $X (no homing)...", flush=True)
+            print("GRBL in Alarm state; clearing lock with $X (no homing)...", flush=True)
             unlock_resp = self._send_line("$X")
             print(f"Unlock response: {unlock_resp}", flush=True)
 
@@ -494,6 +510,24 @@ class GrblController:
         if "error" in resp:
             print(f"GRBL error on arc move: {resp}", flush=True)
 
+    def set_zero(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+        """Redefine the current physical position as (*x*, *y*, *z*) via ``G92``.
+
+        This does **not** move the gantry -- it only changes what GRBL calls
+        the current spot.  It's the only way to correlate GRBL's coordinates
+        to a physical reference point on hardware with no limit switches /
+        homing: without it, GRBL just assumes wherever it happens to be at
+        the moment of a reset (power-on, or the soft-reset this class issues
+        on connect) is (0,0,0), which may not be true.
+
+        The offset is **not persisted** -- it's lost on the next reset the
+        same way GRBL's whole position model is, so it must be re-applied
+        each time a fresh connection is made if it's still needed.
+        """
+        resp = self._send_line(f"G92 X{x:.3f} Y{y:.3f} Z{z:.3f}")
+        if "error" in resp:
+            print(f"GRBL error setting zero: {resp}", flush=True)
+
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
         return self._read_status_report(timeout_s=0.5)
@@ -503,6 +537,75 @@ class GrblController:
         self._serial.write(b"\x18")
         time.sleep(1.0)
         self._drain_buffer()
+
+    def feed_hold(self) -> None:
+        """Send a real-time Feed Hold (``!``).
+
+        Unlike G-code lines, real-time commands bypass the normal
+        line-by-line ok/error handshake entirely and take effect
+        immediately -- this decelerates any in-progress move to a stop
+        using GRBL's own configured acceleration (``$120``-``$122``)
+        rather than abruptly cutting step pulses, which risks lost steps
+        on a machine with no encoder to ever detect that. Returns as soon
+        as the byte is written; it does not wait for the hold to actually
+        complete (see ``wait_for_hold``).
+        """
+        self._serial.write(b"!")
+
+    def wait_for_hold(self, timeout_s: float = 10.0) -> bool:
+        """Block until GRBL is no longer actively moving.
+
+        Polls status until it's anything other than ``Run`` or the
+        in-progress ``Hold:1`` (still decelerating) -- i.e. ``Hold:0``,
+        ``Idle``, or ``Alarm`` all count as stopped.  Waiting for this
+        before a soft-reset avoids truncating an in-progress deceleration
+        ramp, which is the entire point of using Feed Hold over a raw
+        reset in the first place.
+
+        Returns False if *timeout_s* elapses first -- treat that as
+        best-effort and proceed anyway rather than blocking forever.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            status = self._read_status_report(timeout_s=0.5)
+            if status and "Run" not in status and "Hold:1" not in status:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def stop_motion(self) -> None:
+        """Bring any in-progress move to an immediate, controlled stop and
+        discard whatever's left of the current command queue.
+
+        This is the abort primitive used to cut a running sequence short:
+        Feed Hold decelerates smoothly (see ``feed_hold``/``wait_for_hold``)
+        instead of yanking the steppers to a halt, then a soft-reset flushes
+        the remaining queued G-code so a follow-up move (e.g. returning to
+        zero) isn't racing the rest of the original path.
+
+        Best-effort and never raises -- this *is* the abort path, so a
+        hiccup here must not get stuck or escalate into a bigger failure of
+        its own.
+        """
+        try:
+            self.feed_hold()
+            if not self.wait_for_hold():
+                print(
+                    "WARNING: feed hold did not confirm a stop within the timeout -- "
+                    "resetting anyway, but deceleration may not have finished.",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"WARNING: feed hold did not confirm a clean stop: {exc}", flush=True)
+        try:
+            self.soft_reset()
+            # GRBL forgets its active feed rate across a reset (a bare
+            # G1/G2/G3 with no F word since gets error:22) -- invalidate the
+            # cache so the next send_move/send_arc is forced to resend it.
+            self._last_feedrate = None
+            self._clear_alarm()
+        except Exception as exc:
+            print(f"WARNING: reset after stop failed: {exc}", flush=True)
 
     def disconnect(self) -> None:
         """Close the serial connection."""
@@ -597,6 +700,9 @@ def run_sequence(
     cameras: CameraController | None = None,
     record_dir: Path | None = None,
     metadata: RunMetadata | None = None,
+    live_preview: bool = False,
+    preview_queue: multiprocessing.Queue | None = None,
+    preview_fps: float = 15.0,
 ) -> None:
     if time_mode not in {"step", "absolute"}:
         raise ValueError("time_mode must be one of: step, absolute")
@@ -617,30 +723,46 @@ def run_sequence(
     drift_check_pos: tuple[float, float] | None = None
     drift_scheduled_distance_mm = 0.0
 
-    # --- Camera recording (separate process — never blocks timing loop) ---
+    # --- Camera recording / live preview (separate process — never blocks
+    # timing loop, and preview runs at its own rate independent of the
+    # record rate; see CameraRecorderProcess) ---
     _cam_proc: CameraRecorderProcess | None = None
     _cam_cmd_q: multiprocessing.Queue | None = None
     _cam_res_q: multiprocessing.Queue | None = None
-    if cameras is not None and record_dir is not None:
+    if cameras is not None and (record_dir is not None or live_preview):
         _cam_cmd_q = multiprocessing.Queue()
         _cam_res_q = multiprocessing.Queue()
         _cam_proc = CameraRecorderProcess(
             cameras=cameras.camera_specs,
-            fps=cameras.fps,
+            record_fps=cameras.fps,
             cmd_queue=_cam_cmd_q,
             result_queue=_cam_res_q,
+            preview_queue=preview_queue if live_preview else None,
+            preview_fps=preview_fps,
         )
         _cam_proc.start()
-        _cam_cmd_q.put(("start", str(record_dir)))
-        # Wait for confirmation (with timeout)
+        # Wait for the cameras to actually finish opening before proceeding.
+        # Without this, a short sequence (or a preview-only run, which has
+        # no "started" handshake of its own) could run to completion and
+        # tear the process back down before it ever captured a frame.
         try:
-            msg = _cam_res_q.get(timeout=10.0)
-            if msg[0] == "started" and metadata is not None:
-                metadata.recording_paths = dict(msg[1])
-                for label, path in msg[1].items():
-                    print(f"Recording {label} -> {path}", flush=True)
+            ready_msg = _cam_res_q.get(timeout=10.0)
+            if ready_msg[0] == "error":
+                print(f"WARNING: camera setup failed: {ready_msg[1]}", flush=True)
         except Exception:
-            pass
+            print("WARNING: timed out waiting for cameras to become ready", flush=True)
+
+        if record_dir is not None:
+            _cam_cmd_q.put(("start", str(record_dir)))
+            # Wait for confirmation (with timeout)
+            try:
+                msg = _cam_res_q.get(timeout=10.0)
+                if msg[0] == "started" and metadata is not None:
+                    metadata.recording_paths = dict(msg[1])
+                    for label, path in msg[1].items():
+                        print(f"Recording {label} -> {path}", flush=True)
+            except Exception:
+                pass
 
     if metadata is not None:
         metadata.started_utc = datetime.now(timezone.utc).isoformat()
@@ -655,6 +777,8 @@ def run_sequence(
         for index, step in enumerate(steps, start=1):
             if stop_event is not None and stop_event.is_set():
                 print("\nStop requested — aborting sequence.", flush=True)
+                if printer is not None:
+                    printer.stop_motion()
                 break
             steps_completed = index
             if not dry_run:
@@ -715,6 +839,8 @@ def run_sequence(
                     interrupted = _interruptible_sleep(wait_s, stop_event)
                     if interrupted:
                         print("\nStop requested — aborting sequence.", flush=True)
+                        if printer is not None:
+                            printer.stop_motion()
                         break
                 else:
                     time.sleep(wait_s)
@@ -733,47 +859,80 @@ def run_sequence(
         raise
     finally:
         # --- Stop camera process ---
+        # Wrapped end-to-end: a failure anywhere in here (e.g. the recorder
+        # process already died and the queue is broken) must not skip the
+        # metadata/heater-off/homing steps below.
         if _cam_proc is not None:
-            _cam_cmd_q.put(("stop",))
             try:
-                msg = _cam_res_q.get(timeout=10.0)
-                if msg[0] == "stopped":
-                    print(f"Recording stopped: {msg[1]}", flush=True)
-            except Exception:
-                pass
-            _cam_cmd_q.put(("shutdown",))
-            _cam_proc.join(timeout=5.0)
-            if _cam_proc.is_alive():
-                _cam_proc.terminate()
+                if record_dir is not None:
+                    _cam_cmd_q.put(("stop",))
+                    try:
+                        msg = _cam_res_q.get(timeout=10.0)
+                        if msg[0] == "stopped":
+                            print(f"Recording stopped: {msg[1]}", flush=True)
+                    except Exception:
+                        pass
+                _cam_cmd_q.put(("shutdown",))
+                _cam_proc.join(timeout=5.0)
+                if _cam_proc.is_alive():
+                    _cam_proc.terminate()
+            except Exception as exc:
+                print(f"WARNING: failed to cleanly stop the camera recorder process: {exc}", flush=True)
+                if _cam_proc.is_alive():
+                    _cam_proc.terminate()
 
         # --- Write metadata ---
+        # Isolated in its own try/except: a failure here (e.g. disk full,
+        # bad permissions) must never prevent the heater-off / homing steps
+        # below from running.
         if metadata is not None:
-            metadata.completed_utc = datetime.now(timezone.utc).isoformat()
-            metadata.duration_s = time.perf_counter() - start_monotonic
-            metadata.steps_completed = steps_completed
-            metadata.completed = (steps_completed == metadata.total_steps)
-            out_dir = record_dir if record_dir is not None else Path(".")
-            save_run_metadata(metadata, out_dir)
+            try:
+                metadata.completed_utc = datetime.now(timezone.utc).isoformat()
+                metadata.duration_s = time.perf_counter() - start_monotonic
+                metadata.steps_completed = steps_completed
+                metadata.completed = (steps_completed == metadata.total_steps)
+                out_dir = record_dir if record_dir is not None else Path(".")
+                save_run_metadata(metadata, out_dir)
+            except Exception as exc:
+                print(f"WARNING: failed to save run metadata: {exc}", flush=True)
 
+        # --- Heater off ---
+        # Safety-critical, so it gets its own try/except too: a comms hiccup
+        # here must not skip the gantry-homing / disconnect steps below.
         if not dry_run and dps is not None:
-            dps.onoff("w", 0)
-            print("Light turned off.", flush=True)
+            try:
+                dps.onoff("w", 0)
+                print("Light turned off.", flush=True)
+            except Exception as exc:
+                print(
+                    f"WARNING: failed to confirm the heater turned off: {exc}. "
+                    "Check the DPS5005 manually.",
+                    flush=True,
+                )
+
+        # --- Return to a known position and release the serial port ---
         if printer is not None:
-            if return_to_origin:
-                print(
-                    "Moving to origin: X=0.000 Y=0.000 Z=0.000",
-                    flush=True,
-                )
-                origin_feedrate = home_step.feedrate if home_step is not None else 1200.0
-                printer.send_move(0.0, 0.0, 0.0, origin_feedrate)
-            elif home_step is not None:
-                print(
-                    f"Moving to initial position: "
-                    f"X={home_step.x:.3f} Y={home_step.y:.3f} Z={home_step.z:.3f}",
-                    flush=True,
-                )
-                printer.send_move(home_step.x, home_step.y, home_step.z, home_step.feedrate)
-            printer.disconnect()
+            try:
+                if return_to_origin:
+                    print(
+                        "Moving to origin: X=0.000 Y=0.000 Z=0.000",
+                        flush=True,
+                    )
+                    origin_feedrate = home_step.feedrate if home_step is not None else 1200.0
+                    printer.send_move(0.0, 0.0, 0.0, origin_feedrate)
+                elif home_step is not None:
+                    print(
+                        f"Moving to initial position: "
+                        f"X={home_step.x:.3f} Y={home_step.y:.3f} Z={home_step.z:.3f}",
+                        flush=True,
+                    )
+                    printer.send_move(home_step.x, home_step.y, home_step.z, home_step.feedrate)
+            except Exception as exc:
+                print(f"WARNING: failed to return gantry to a safe position: {exc}", flush=True)
+            finally:
+                # Always release the port, even if the homing move above
+                # timed out -- otherwise it's left open/orphaned.
+                printer.disconnect()
 
 
 def parse_args() -> argparse.Namespace:

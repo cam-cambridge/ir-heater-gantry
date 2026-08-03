@@ -1,0 +1,50 @@
+{
+  "run_id": "20260803_223359",
+  "started_utc": "2026-08-03T22:34:01.774771+00:00",
+  "completed_utc": "2026-08-03T22:37:23.654850+00:00",
+  "duration_s": 203.9564608310002,
+  "completed": false,
+  "csv_file": "",
+  "loops": 1,
+  "time_mode": "step",
+  "default_feedrate": 1200.0,
+  "dry_run": false,
+  "return_to_origin": true,
+  "grbl_port": "/dev/ttyUSB1",
+  "grbl_baud": 115200,
+  "x_max": null,
+  "y_max": null,
+  "z_max": null,
+  "dps_port": "/dev/ttyUSB0",
+  "dps_address": 1,
+  "dps_baud": 9600,
+  "cameras": {
+    "cam0": 0,
+    "cam2": 2
+  },
+  "cam_fps": 5.0,
+  "record_dir": "recordings",
+  "recording_paths": {
+    "cam0": "recordings/cam0_20260803_223401.mp4",
+    "cam2": "recordings/cam2_20260803_223401.mp4"
+  },
+  "total_steps": 312,
+  "steps_completed": 88,
+  "error": "",
+  "drift_warnings": [
+    "WARNING: motion drift -- gantry covered 2.4mm in the last 7.3s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.5mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.3mm in the last 7.2s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.5mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.2mm in the last 7.1s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.5mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.2mm in the last 7.1s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.5mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.1mm in the last 7.0s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.6mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.0mm in the last 7.0s, schedule expected ~20.9mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.6mm in the last 10.3s, schedule expected ~28.7mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.4mm in the last 5.5s, schedule expected ~17.0mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware).",
+    "WARNING: motion drift -- gantry covered 2.0mm in the last 8.4s, schedule expected ~24.8mm. Physical position may be lagging the commanded schedule (e.g. dwell_time_s/feedrate too aggressive for the hardware)."
+  ]
+}

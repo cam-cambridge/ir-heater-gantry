@@ -238,6 +238,24 @@ class AlignmentWindow(QMainWindow):
         # --- Saved positions ---
         self._saved_positions: list[dict[str, str]] = []
 
+        # Guards re-entrancy into GRBL serial I/O.  A jog/go-to command blocks
+        # this (single) GUI thread until GRBL replies, so normally a second
+        # click can't be dispatched mid-command -- but QMessageBox.critical()
+        # (raised from a timeout) pumps a *nested* Qt event loop, which will
+        # happily deliver queued-up clicks from rapid button-mashing while
+        # the first call is still unwinding.  That reentrant call reuses the
+        # same serial handle concurrently with the outer one, interleaving
+        # reads/writes and corrupting the ok/error handshake -- this is the
+        # actual cause of the "many jog clicks -> crash" reports.  Buttons
+        # are disabled below for the duration of every command so those
+        # queued clicks are never delivered in the first place, and the
+        # position-poll timer checks the same flag so it can't sneak a `?`
+        # query in between either.
+        self._hw_busy = False
+        self._jog_buttons: list[QPushButton] = []
+        self._go_btn: QPushButton | None = None
+        self._zero_btn: QPushButton | None = None
+
         self._build_ui()
 
         # Connect hardware (deferred so the window paints first)
@@ -315,6 +333,7 @@ class AlignmentWindow(QMainWindow):
             b = QPushButton(text)
             b.setFixedSize(64, 36)
             b.clicked.connect(lambda: self._jog(dx, dy, dz))
+            self._jog_buttons.append(b)
             return b
 
         dpad.addWidget(_btn("Y+", 0, 1, 0), 0, 1)
@@ -333,6 +352,22 @@ class AlignmentWindow(QMainWindow):
         self._pos_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         pos_layout.addWidget(self._pos_label)
 
+        zero_row = QHBoxLayout()
+        zero_btn = QPushButton("Zero Here")
+        zero_btn.setToolTip(
+            "Redefine the current physical position as X0 Y0 Z0 (G92).\n"
+            "There are no limit switches / homing on this machine, so GRBL\n"
+            "otherwise just assumes wherever it is at connect/reset is zero.\n"
+            "Jog to your physical reference mark first, then click this.\n"
+            "Does not move the gantry, and does not survive a reconnect --\n"
+            "re-zero here again after every reconnect before running a sequence."
+        )
+        zero_btn.clicked.connect(self._zero_here)
+        zero_row.addWidget(zero_btn)
+        zero_row.addStretch()
+        pos_layout.addLayout(zero_row)
+        self._zero_btn = zero_btn
+
         goto_row = QHBoxLayout()
         goto_row.addWidget(QLabel("Go to X:"))
         self._goto_x = QLineEdit()
@@ -349,6 +384,7 @@ class AlignmentWindow(QMainWindow):
         go_btn = QPushButton("Go")
         go_btn.clicked.connect(self._goto)
         goto_row.addWidget(go_btn)
+        self._go_btn = go_btn
         pos_layout.addLayout(goto_row)
         ctrl_layout.addWidget(pos_gb)
 
@@ -538,10 +574,23 @@ class AlignmentWindow(QMainWindow):
     #  Jog / movement
     # ------------------------------------------------------------------
 
+    def _set_hw_controls_enabled(self, enabled: bool) -> None:
+        for btn in self._jog_buttons:
+            btn.setEnabled(enabled)
+        if self._go_btn is not None:
+            self._go_btn.setEnabled(enabled)
+        if self._zero_btn is not None:
+            self._zero_btn.setEnabled(enabled)
+
     def _jog(self, dx_sign: int, dy_sign: int, dz_sign: int) -> None:
         grbl = self._grbl
         if grbl is None:
             QMessageBox.warning(self, "No GRBL", "GRBL is not connected.")
+            return
+        if self._hw_busy:
+            # A previous jog/go-to is still in flight (or its error dialog is
+            # still up) -- ignore this click rather than re-entering GRBL
+            # serial I/O from a second call stacked on top of the first.
             return
         try:
             step = float(self._step_cb.currentText())
@@ -551,19 +600,34 @@ class AlignmentWindow(QMainWindow):
             fr = float(self._jog_fr.text() or 600)
         except ValueError:
             fr = 600.0
+
+        self._hw_busy = True
+        self._set_hw_controls_enabled(False)
         try:
             grbl._drain_buffer()
             grbl._send_line("G91")
-            grbl._send_line(f"G1 F{fr:.1f}")
-            grbl._send_line(
-                f"G1 X{dx_sign * step:.3f} Y{dy_sign * step:.3f} Z{dz_sign * step:.3f}"
-            )
-            grbl._send_line("G90")
+            try:
+                grbl._send_line(f"G1 F{fr:.1f}")
+                grbl._send_line(
+                    f"G1 X{dx_sign * step:.3f} Y{dy_sign * step:.3f} Z{dz_sign * step:.3f}"
+                )
+            finally:
+                # Always try to leave GRBL back in absolute mode, even if the
+                # move above timed out -- otherwise every subsequent "Go to"
+                # or saved-position move would silently be interpreted as a
+                # *relative* move instead, sending the gantry to the wrong
+                # place.
+                grbl._send_line("G90")
         except (TimeoutError, OSError) as exc:
             QMessageBox.critical(self, "Jog Error", str(exc))
+        finally:
+            self._hw_busy = False
+            self._set_hw_controls_enabled(True)
 
     def _goto(self) -> None:
         if self._grbl is None:
+            return
+        if self._hw_busy:
             return
         try:
             x = float(self._goto_x.text())
@@ -576,13 +640,49 @@ class AlignmentWindow(QMainWindow):
             fr = float(self._jog_fr.text() or 600)
         except ValueError:
             fr = 600.0
+
+        self._hw_busy = True
+        self._set_hw_controls_enabled(False)
         try:
             self._grbl.send_move(x, y, z, fr)
         except (TimeoutError, OSError) as exc:
             QMessageBox.critical(self, "Go-to Error", str(exc))
+        finally:
+            self._hw_busy = False
+            self._set_hw_controls_enabled(True)
+
+    def _zero_here(self) -> None:
+        if self._grbl is None:
+            QMessageBox.warning(self, "No GRBL", "GRBL is not connected.")
+            return
+        if self._hw_busy:
+            return
+        reply = QMessageBox.question(
+            self, "Zero Here",
+            "Set the current position as X0 Y0 Z0?\n\n"
+            "This redefines coordinates for the rest of this connection -- "
+            "make sure you're at the physical reference point you want "
+            "sequences to run relative to.",
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._hw_busy = True
+        self._set_hw_controls_enabled(False)
+        try:
+            self._grbl.set_zero()
+        except (TimeoutError, OSError) as exc:
+            QMessageBox.critical(self, "Zero Error", str(exc))
+        finally:
+            self._hw_busy = False
+            self._set_hw_controls_enabled(True)
 
     def _update_position(self) -> None:
         if self._grbl is None:
+            return
+        if self._hw_busy:
+            # Don't interleave a `?` status query with an in-flight jog/go-to
+            # command's own read of the serial stream.
             return
         try:
             status = self._grbl.get_status()

@@ -229,7 +229,7 @@ class PatternUtilityWindow(QMainWindow):
         # Radius / Width+Height (stacked based on shape)
         size_stack = QStackedWidget()
 
-        # Page 0: circle radius
+        # Page 0: circle radius + ring count
         circle_page = QWidget()
         circle_row = QHBoxLayout(circle_page)
         circle_row.setContentsMargins(0, 0, 0, 0)
@@ -237,6 +237,14 @@ class PatternUtilityWindow(QMainWindow):
         self._dwell_radius.setMaximumWidth(55)
         circle_row.addWidget(QLabel("Radius (mm):"))
         circle_row.addWidget(self._dwell_radius)
+        self._dwell_num_rings = QLineEdit("5")
+        self._dwell_num_rings.setMaximumWidth(40)
+        self._dwell_num_rings.setToolTip(
+            "Exact number of concentric rings, evenly spaced from centre out "
+            "to Radius (the outermost ring always lands exactly on Radius)."
+        )
+        circle_row.addWidget(QLabel("Rings:"))
+        circle_row.addWidget(self._dwell_num_rings)
         circle_row.addStretch()
         size_stack.addWidget(circle_page)
 
@@ -263,6 +271,11 @@ class PatternUtilityWindow(QMainWindow):
         self._dwell_llen.setMaximumWidth(55)
         line_row.addWidget(QLabel("Length (mm):"))
         line_row.addWidget(self._dwell_llen)
+        self._dwell_langle = QLineEdit("0")
+        self._dwell_langle.setMaximumWidth(45)
+        self._dwell_langle.setToolTip("Line orientation in degrees (0 = horizontal / X-axis).")
+        line_row.addWidget(QLabel("Angle (°):"))
+        line_row.addWidget(self._dwell_langle)
         line_row.addStretch()
         size_stack.addWidget(line_page)
 
@@ -274,6 +287,20 @@ class PatternUtilityWindow(QMainWindow):
         feedrate_hint.setStyleSheet("color: #888; font-style: italic;")
         feedrate_hint.setWordWrap(True)
         dwell_form.addRow("", feedrate_hint)
+
+        r_row = QHBoxLayout()
+        self._dwell_repeats = QLineEdit("1")
+        self._dwell_repeats.setMaximumWidth(40)
+        self._dwell_repeats.setToolTip(
+            "Retrace the dwell path this many times within the same dwell "
+            "time (feedrate scales up accordingly) -- multiple slower passes "
+            "spread across the full dwell duration tend to heat more evenly "
+            "than a single continuous sweep."
+        )
+        r_row.addWidget(QLabel("Repeats:"))
+        r_row.addWidget(self._dwell_repeats)
+        r_row.addStretch()
+        dwell_form.addRow("", r_row)
 
         m_row = QHBoxLayout()
         self._dwell_z = QLineEdit("0")
@@ -467,17 +494,26 @@ class PatternUtilityWindow(QMainWindow):
             z_val = float(self._dwell_z.text())
             voltage = float(self._dwell_v.text())
             current = float(self._dwell_i.text())
+            repeats = int(self._dwell_repeats.text())
+            if repeats < 1:
+                raise ValueError("repeats must be >= 1")
+            num_rings = int(self._dwell_num_rings.text())
+            if num_rings < 1:
+                raise ValueError("rings must be >= 1")
             shape = self._dwell_shape_cb.currentText()
             width_mm = ""
             height_mm = ""
+            angle_deg = ""
             if shape == "rectangle":
                 width_mm = f"{float(self._dwell_width.text()):.1f}"
                 height_mm = f"{float(self._dwell_height.text()):.1f}"
             elif shape == "line":
                 width_mm = f"{float(self._dwell_llen.text()):.1f}"
+                angle_deg = f"{float(self._dwell_langle.text()):.1f}"
         except ValueError:
             QMessageBox.warning(self, "Input Error",
-                                "All dwell parameters must be numeric.")
+                                "All dwell parameters must be numeric "
+                                "(repeats and rings must be whole numbers >= 1).")
             return
 
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -485,7 +521,7 @@ class PatternUtilityWindow(QMainWindow):
             writer.writerow([
                 "label", "x", "y", "z", "dwell_time_s", "radius_mm",
                 "voltage_v", "current_a",
-                "shape", "width_mm", "height_mm",
+                "shape", "width_mm", "height_mm", "repeats", "num_rings", "angle_deg",
             ])
             for i, (x, y, lbl) in enumerate(all_points):
                 writer.writerow([
@@ -493,7 +529,7 @@ class PatternUtilityWindow(QMainWindow):
                     f"{x:.3f}", f"{y:.3f}", f"{z_val:.3f}",
                     f"{dwell_time:.1f}", f"{radius:.1f}",
                     f"{voltage:.2f}", f"{current:.2f}",
-                    shape, width_mm, height_mm,
+                    shape, width_mm, height_mm, repeats, num_rings, angle_deg,
                 ])
 
         QMessageBox.information(

@@ -402,38 +402,90 @@ class CameraController:
 #  Process-based recorder  (isolates disk I/O from timing-critical loop)
 # ======================================================================
 
+def _push_latest(q: multiprocessing.Queue, item: object) -> None:
+    """Non-blocking "replace, don't queue" push.
+
+    Drops whatever's currently sitting in *q* (if the consumer hasn't drained
+    it yet) and puts *item* in its place. Never blocks and never raises --
+    a full or momentarily-contended queue just means the consumer sees the
+    newer frame instead of the older one, which is exactly what a live
+    preview wants (nobody needs a backlog of stale frames).
+    """
+    try:
+        q.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        pass
+
+
+def _encode_preview_jpeg(frame: np.ndarray, max_width: int, quality: int = 60) -> bytes | None:
+    """Downsize *frame* to *max_width* (if wider) and JPEG-encode it for a
+    cheap trip across a multiprocessing Queue -- full-resolution raw frames
+    would be far more expensive to pickle and to redraw in the GUI."""
+    h, w = frame.shape[:2]
+    if w > max_width:
+        frame = cv2.resize(frame, (max_width, int(h * max_width / w)))
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes() if ok else None
+
+
 class CameraRecorderProcess(multiprocessing.Process):
     """Runs multi-camera capture + recording in a separate process.
 
-    Communication via two :class:`~multiprocessing.Queue` instances:
+    Recording and live preview run at **independent** frame rates -- e.g.
+    record at 1fps to save disk space while still previewing at 15fps for a
+    responsive live view. Both are driven off the same underlying capture
+    loop; the two rates just gate how often each side effect (disk write vs.
+    preview push) actually happens. Neither has any effect on GRBL command
+    timing, which runs in a completely different OS process -- see
+    ``run_sequence`` in sequence_runner.py.
+
+    Communication via two :class:`~multiprocessing.Queue` instances (plus an
+    optional third for preview frames):
 
     *cmd_queue* (main → recorder):
-        ``("start", output_dir)`` — begin recording
+        ``("start", output_dir)`` — begin recording to disk
         ``("stop",)``            — finalise video files
         ``("shutdown",)``        — exit the process
 
     *result_queue* (recorder → main):
+        ``("ready", None)``                       — cameras opened, capture loop is live
         ``("started", {label: path_str, ...})``   — recording has begun
         ``("stopped", {label: path_str, ...})``   — recording finalised
         ``("error", message)``                    — an error occurred
+
+    *preview_queue* (recorder → main), if given at construction:
+        ``{label: jpeg_bytes, ...}`` -- latest downsized frame per camera,
+        pushed via :func:`_push_latest` (never blocks the capture loop).
+        Populated whenever the process is running, independent of whether
+        recording to disk is also active.
     """
 
     def __init__(
         self,
         cameras: list[CameraSpec],
-        fps: float,
+        record_fps: float,
         cmd_queue: multiprocessing.Queue,
         result_queue: multiprocessing.Queue,
         fourcc: str = _DEFAULT_FOURCC,
         min_fps: float = _DEFAULT_MIN_FPS,
+        preview_queue: multiprocessing.Queue | None = None,
+        preview_fps: float = _DEFAULT_FPS,
+        preview_max_width: int = 480,
     ) -> None:
         super().__init__(daemon=True, name="cam-recorder")
         self._cameras = list(cameras)
-        self._fps = fps
+        self._record_fps = record_fps
         self._cmd_queue = cmd_queue
         self._result_queue = result_queue
         self._fourcc = fourcc
         self._min_fps = min_fps
+        self._preview_queue = preview_queue
+        self._preview_fps = preview_fps
+        self._preview_max_width = preview_max_width
 
     def run(self) -> None:
         labels = [label for label, _ in self._cameras]
@@ -443,7 +495,16 @@ class CameraRecorderProcess(multiprocessing.Process):
         # docstring for why VideoWriter's constant-fps assumption needs this.
         frame_logs: list[TextIO | None] = [None] * len(self._cameras)
         frame_counts: list[int] = [0] * len(self._cameras)
-        frame_interval = 1.0 / max(self._fps, self._min_fps)
+        record_interval = 1.0 / max(self._record_fps, self._min_fps)
+        preview_interval = (
+            1.0 / max(self._preview_fps, self._min_fps)
+            if self._preview_queue is not None
+            else None
+        )
+        # Poll/capture at whichever rate is faster so a slow record_fps
+        # (e.g. 1fps, to save disk space) never throttles a faster preview.
+        poll_interval = min(record_interval, preview_interval) if preview_interval else record_interval
+        capture_fps = max(self._record_fps, self._preview_fps if preview_interval else 0.0)
         paths: dict[str, Path] = {}
 
         def _close_frame_logs() -> None:
@@ -459,8 +520,16 @@ class CameraRecorderProcess(multiprocessing.Process):
                 if not cap.isOpened():
                     self._result_queue.put(("error", f"Cannot open camera {cam_id} ({label})"))
                     return
-                cap.set(cv2.CAP_PROP_FPS, self._fps)
+                cap.set(cv2.CAP_PROP_FPS, capture_fps)
                 caps.append(cap)
+
+            # Signal "cameras open, ready to capture" independent of whether
+            # recording was requested -- the "started" message below only
+            # fires once disk recording begins, so a preview-only caller
+            # (no recording) would otherwise have no way to know the process
+            # is actually ready and could tear it down again (e.g. at the
+            # end of a short sequence) before it ever captured a frame.
+            self._result_queue.put(("ready", None))
 
             # --- Helper: open writers for every camera immediately ---
             def _open_writers(out_dir: Path, ts: str) -> dict[str, Path]:
@@ -478,7 +547,7 @@ class CameraRecorderProcess(multiprocessing.Process):
                     h, w = frame.shape[:2]
                     stem = f"{_safe_filename_part(label)}_{ts}"
                     p = out_dir / f"{stem}.mp4"
-                    writers[i] = cv2.VideoWriter(str(p), fourcc_code, self._fps, (w, h))
+                    writers[i] = cv2.VideoWriter(str(p), fourcc_code, self._record_fps, (w, h))
                     log_file = (out_dir / f"{stem}_frames.csv").open(
                         "w", newline="", encoding="utf-8"
                     )
@@ -489,12 +558,13 @@ class CameraRecorderProcess(multiprocessing.Process):
                 return new_paths
 
             recording = False
-            last_write = 0.0
+            last_record_write = 0.0
+            last_preview_push = 0.0
 
             while True:
                 # --- Blocking wait for next command or frame interval ---
                 try:
-                    cmd = self._cmd_queue.get(timeout=frame_interval)
+                    cmd = self._cmd_queue.get(timeout=poll_interval)
                 except queue.Empty:
                     cmd = None
 
@@ -527,18 +597,20 @@ class CameraRecorderProcess(multiprocessing.Process):
                         )
                         continue
 
-                if not recording:
+                # Nothing to do: not recording, and no one wants a preview.
+                if not recording and self._preview_queue is None:
                     continue
 
-                # --- Capture frames ---
+                # --- Capture frames (shared by both recording and preview) ---
                 frames: list[np.ndarray | None] = []
                 for cap in caps:
                     ok, frame = cap.read()
                     frames.append(frame if ok else None)
 
-                # --- Throttled write ---
                 now = time.perf_counter()
-                if (now - last_write) >= frame_interval:
+
+                # --- Throttled write to disk -- independent of preview rate ---
+                if recording and (now - last_record_write) >= record_interval:
                     frame_ts = datetime.now(tz=UTC).isoformat()
                     for i, frame in enumerate(frames):
                         if frame is None:
@@ -549,7 +621,24 @@ class CameraRecorderProcess(multiprocessing.Process):
                             if log_file is not None:
                                 csv.writer(log_file).writerow([frame_counts[i], frame_ts])
                                 frame_counts[i] += 1
-                    last_write = now
+                    last_record_write = now
+
+                # --- Throttled preview push -- independent of record rate ---
+                if (
+                    self._preview_queue is not None
+                    and preview_interval is not None
+                    and (now - last_preview_push) >= preview_interval
+                ):
+                    payload: dict[str, bytes] = {}
+                    for label, frame in zip(labels, frames):
+                        if frame is None:
+                            continue
+                        jpeg = _encode_preview_jpeg(frame, self._preview_max_width)
+                        if jpeg is not None:
+                            payload[label] = jpeg
+                    if payload:
+                        _push_latest(self._preview_queue, payload)
+                    last_preview_push = now
 
         except Exception as exc:
             # Top-level safety net — report any unhandled error to the

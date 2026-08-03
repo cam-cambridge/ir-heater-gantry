@@ -53,6 +53,9 @@ class HeatLocation:
     shape: str = "circle"    # "circle" | "rectangle" | "line"
     width_mm: float = 0.0    # full width for rectangle; full length for line
     height_mm: float = 0.0   # full height for rectangle (ignored for line)
+    repeats: int = 1         # how many times to retrace the dwell path within dwell_time_s
+    num_rings: int = 5       # circle shape only: exact number of concentric rings
+    angle_deg: float = 0.0   # line shape only: orientation, 0 = horizontal / X-axis
 
 
 @dataclass(frozen=True)
@@ -183,7 +186,7 @@ def _line_points(
 #  Ring (G2/G3 arc) dwell-pattern generation
 # ---------------------------------------------------------------------------
 
-def _ring_segments(cx: float, cy: float, radius: float, ring_spacing_mm: float) -> list[_PathSegment]:
+def _ring_segments(cx: float, cy: float, radius: float, num_rings: int) -> list[_PathSegment]:
     """Concentric-ring coverage path from centre out to *radius*.
 
     Steps out from the centre to the innermost ring, traces it as two G3
@@ -193,12 +196,12 @@ def _ring_segments(cx: float, cy: float, radius: float, ring_spacing_mm: float) 
     fewer G-code lines (less serial overhead, less drift risk) and traces
     mechanically exact circles instead of a polygon approximation.
 
-    Rings are spaced roughly *ring_spacing_mm* apart, evenly dividing
-    [0, radius] so the outermost ring always lands exactly on *radius*.
+    Exactly *num_rings* rings are used, evenly dividing [0, radius] so the
+    outermost ring always lands exactly on *radius*.
     """
     if radius <= 0:
         return []
-    num_rings = max(1, round(radius / ring_spacing_mm))
+    num_rings = max(1, num_rings)
     radii = [radius * (k + 1) / num_rings for k in range(num_rings)]
 
     segments: list[_PathSegment] = []
@@ -233,7 +236,7 @@ def _linear_segments(points: list[tuple[float, float]]) -> list[_PathSegment]:
     return segments
 
 
-def generate_dwell_rows(loc: HeatLocation, ring_spacing_mm: float = 2.0) -> list[SequenceRow]:
+def generate_dwell_rows(loc: HeatLocation) -> list[SequenceRow]:
     """Create the slow dwell pattern for a single ``HeatLocation``.
 
     For ``shape == "circle"``: concentric G2/G3 ring arcs (see ``_ring_segments``).
@@ -248,6 +251,14 @@ def generate_dwell_rows(loc: HeatLocation, ring_spacing_mm: float = 2.0) -> list
     could silently disagree with what ``dwell_time_s`` implied, causing the
     gantry's actual position to drift away from what the timing loop (and
     therefore the DPS voltage/current schedule) assumed.
+
+    ``loc.repeats`` retraces the whole path that many times *within* the
+    same ``dwell_time_s`` (the feedrate scales up accordingly) -- e.g. 3
+    slower loops around a ring spread across the dwell time, rather than
+    one continuous pass. For real (non-ideal) heat diffusion, several
+    passes revisit every point multiple times across the full dwell
+    duration instead of depositing it all in one continuous sweep, which
+    tends to even out heating better than a single lap.
     """
     if loc.dwell_time_s <= 0:
         return []
@@ -264,9 +275,13 @@ def generate_dwell_rows(loc: HeatLocation, ring_spacing_mm: float = 2.0) -> list
         if length <= 0:
             return []
         passes = max(2, int(loc.dwell_time_s / 2.0))
-        segments = _linear_segments(_line_points(loc.x, loc.y, length, passes=passes))
+        segments = _linear_segments(
+            _line_points(loc.x, loc.y, length, angle_deg=loc.angle_deg, passes=passes)
+        )
     else:
-        segments = _ring_segments(loc.x, loc.y, loc.radius_mm, ring_spacing_mm=ring_spacing_mm)
+        segments = _ring_segments(loc.x, loc.y, loc.radius_mm, num_rings=loc.num_rings)
+
+    segments = segments * max(1, loc.repeats)
 
     total_dist = sum(seg.length_mm for seg in segments)
     if total_dist <= 0:
@@ -307,7 +322,6 @@ def generate_dwell_rows(loc: HeatLocation, ring_spacing_mm: float = 2.0) -> list
 def generate_heat_sequence(
     locations: list[HeatLocation],
     travel_feedrate: float = 2000.0,
-    ring_spacing_mm: float = 2.0,
     start_position: Position | None = None,
 ) -> list[SequenceRow]:
     """Build a full sequence: travel to each location, dwell, repeat.
@@ -315,12 +329,12 @@ def generate_heat_sequence(
     Parameters
     ----------
     locations:
-        Ordered list of heat locations.
+        Ordered list of heat locations. Each carries its own ``num_rings``
+        (circle shape only) and ``repeats`` -- there's no sequence-wide
+        override, since ring density is a per-location choice, not a global
+        one.
     travel_feedrate:
         Feedrate (mm/min) to use when moving *between* locations (fast).
-    ring_spacing_mm:
-        Approximate radial spacing between concentric dwell rings for
-        circle-shape locations (smaller = more rings = denser coverage).
     start_position:
         Gantry position when the sequence starts, if known (e.g. read off
         the alignment GUI beforehand). Used to compute a real travel time
@@ -381,7 +395,7 @@ def generate_heat_sequence(
             )
 
         # --- Dwell pattern at this location ---
-        dwell_rows = generate_dwell_rows(loc, ring_spacing_mm=ring_spacing_mm)
+        dwell_rows = generate_dwell_rows(loc)
         rows.extend(dwell_rows)
 
         # Dwell patterns don't necessarily end back at the location's centre
@@ -405,7 +419,10 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
     """Parse a CSV of heat locations.
 
     Required columns: ``x, y, z, dwell_time_s, radius_mm, voltage_v, current_a``
-    Optional column: ``label``
+    Optional columns: ``label``, ``repeats`` (retrace the dwell path this many
+    times within ``dwell_time_s``; default 1), ``num_rings`` (circle shape
+    only: exact number of concentric rings; default 5), ``angle_deg`` (line
+    shape only: orientation in degrees, 0 = horizontal / X-axis; default 0)
 
     There is deliberately no ``dwell_feedrate`` column -- the dwell speed is
     derived from the path length and ``dwell_time_s`` (see
@@ -431,6 +448,13 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
             try:
                 raw_shape = (row.get("shape") or "").strip().lower()
                 shape = raw_shape if raw_shape in ("circle", "rectangle", "line") else "circle"
+                repeats = int(row.get("repeats", 1) or 1)
+                if repeats < 1:
+                    raise ValueError("repeats must be >= 1")
+                num_rings = int(row.get("num_rings", 5) or 5)
+                if num_rings < 1:
+                    raise ValueError("num_rings must be >= 1")
+                angle_deg = float(row.get("angle_deg", 0) or 0)
                 loc = HeatLocation(
                     x=float(row.get("x", 0) or 0),
                     y=float(row.get("y", 0) or 0),
@@ -443,6 +467,9 @@ def read_heat_locations_csv(csv_path: Path) -> list[HeatLocation]:
                     shape=shape,
                     width_mm=float(row.get("width_mm", 0) or 0),
                     height_mm=float(row.get("height_mm", 0) or 0),
+                    repeats=repeats,
+                    num_rings=num_rings,
+                    angle_deg=angle_deg,
                 )
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid value at line {ln}: {exc}") from exc
@@ -490,13 +517,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--locations", type=Path, required=True,
-        help="CSV of heat locations (x,y,z,dwell_time_s,radius_mm,voltage_v,current_a)",
+        help="CSV of heat locations (x,y,z,dwell_time_s,radius_mm,voltage_v,current_a; "
+             "optional num_rings column for circle shape, default 5; optional "
+             "angle_deg column for line shape, default 0)",
     )
     parser.add_argument("--output", type=Path, default=Path("sequence.csv"))
     parser.add_argument("--travel-feedrate", type=float, default=2000.0,
                         help="Feedrate between locations (mm/min)")
-    parser.add_argument("--ring-spacing-mm", type=float, default=2.0,
-                        help="Radial spacing between concentric dwell rings (circle shape only)")
     parser.add_argument(
         "--start-x", type=float, default=None,
         help="Gantry's known X position when the sequence starts (e.g. from the "
@@ -520,7 +547,6 @@ def main() -> None:
     rows = generate_heat_sequence(
         locations,
         travel_feedrate=args.travel_feedrate,
-        ring_spacing_mm=args.ring_spacing_mm,
         start_position=start_position,
     )
     write_sequence_csv(rows, args.output)
