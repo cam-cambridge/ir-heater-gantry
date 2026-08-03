@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+#recordings and data
+recordings/
+run_metadata*

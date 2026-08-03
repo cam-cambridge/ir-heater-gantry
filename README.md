@@ -1,13 +1,13 @@
 # IR Heater Sequence Runner
 
-Synchronized control of a **GRBL-based CNC gantry** and a **DPS5005 power supply**
+Synchronized control of a **GRBL-based CNC gantry** and a **DPS3005 power supply**
 for automated IR heating experiments.  Includes multi-camera recording, visual
 pattern generation, and a manual alignment/jog interface.
 
 ## Hardware
 
 - **GRBL controller** (Acmer laser cutter or any GRBL 1.1 gantry) via raw serial
-- **DPS5005** programmable DC supply via Modbus RTU (for the IR heater) —
+- **DPS3005** programmable DC supply via Modbus RTU (for the IR heater) —
   writes (voltage/current/on-off) retry a few times on transient RS485
   errors, then raise instead of failing silently, so a dropped "turn heater
   off" can no longer go unnoticed
@@ -240,8 +240,7 @@ time,current,voltage,x,y,z,feedrate
 
 A row is an ordinary linear move (`G1`) unless both `arc_i` and `arc_j` are
 given, in which case it becomes a circular arc (`G2` clockwise by default, or
-`G3` if `arc_dir` is `ccw`) — GRBL's native circular interpolation, computed
-exactly in firmware rather than approximated with short straight segments.
+`G3` if `arc_dir` is `ccw`) — GRBL's native circular interpolation, computed in firmware
 `arc_i`/`arc_j` follow GRBL's own convention: the offset from the *row's
 starting point* (i.e. the previous row's `x`/`y`) to the arc's center — not
 a bare `i`/`j`, since `i` already aliases the `current` column above and a
@@ -301,14 +300,7 @@ Instead, `run_sequence` periodically (every `_DRIFT_CHECK_INTERVAL_S` = 5s of
 wall-clock time, **not** every step, so it can't affect motion smoothness)
 samples GRBL's real position (`?` status query) and compares it against the
 schedule's *current target* (the most recently commanded step's X/Y) — a
-following-error check, not a "distance covered" check. An earlier version
-compared the schedule's total path length traveled in a window against the
-straight-line displacement between two sampled points, but every dwell
-pattern here loops back near its own start (ring arcs, back-and-forth
-lines/rasters), so that comparison false-positived on the pattern's own
-geometry: a window that happened to sample across a near-closed loop looked
-like near-zero coverage even at perfect real speed. Comparing like-for-like
-positions avoids that. If the gap exceeds `_DRIFT_WARN_MM` (3mm), it prints a
+following-error check, not a "distance covered" check. If the gap exceeds `_DRIFT_WARN_MM` (3mm), it prints a
 `WARNING: motion drift` message and appends it to `metadata.drift_warnings` in
 the run's JSON log — e.g. a sign that a dwell's implied speed is more than the
 hardware can actually sustain. This never gates or slows the command stream;
