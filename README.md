@@ -299,14 +299,21 @@ whatever dwells longer at each forced stop).
 
 Instead, `run_sequence` periodically (every `_DRIFT_CHECK_INTERVAL_S` = 5s of
 wall-clock time, **not** every step, so it can't affect motion smoothness)
-samples GRBL's real position (`?` status query) and compares how far it
-actually moved against how far the schedule expected it to move in that same
-window. If the gantry covered less than half (`_DRIFT_WARN_FRACTION`) of the
-scheduled distance, it prints a `WARNING: motion drift` message and appends
-it to `metadata.drift_warnings` in the run's JSON log — e.g. a sign that a
-dwell's implied speed is more than the hardware can actually sustain. This
-never gates or slows the command stream; it's a verification/alerting layer
-on top of the existing open-loop timing, not a synchronization mechanism.
+samples GRBL's real position (`?` status query) and compares it against the
+schedule's *current target* (the most recently commanded step's X/Y) — a
+following-error check, not a "distance covered" check. An earlier version
+compared the schedule's total path length traveled in a window against the
+straight-line displacement between two sampled points, but every dwell
+pattern here loops back near its own start (ring arcs, back-and-forth
+lines/rasters), so that comparison false-positived on the pattern's own
+geometry: a window that happened to sample across a near-closed loop looked
+like near-zero coverage even at perfect real speed. Comparing like-for-like
+positions avoids that. If the gap exceeds `_DRIFT_WARN_MM` (3mm), it prints a
+`WARNING: motion drift` message and appends it to `metadata.drift_warnings` in
+the run's JSON log — e.g. a sign that a dwell's implied speed is more than the
+hardware can actually sustain. This never gates or slows the command stream;
+it's a verification/alerting layer on top of the existing open-loop timing,
+not a synchronization mechanism.
 
 ## Connecting to custom GRBL boards (e.g. ACMER)
 

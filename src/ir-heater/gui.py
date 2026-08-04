@@ -77,6 +77,11 @@ from sequence_runner import (
 #  Constants
 # ---------------------------------------------------------------------------
 _DEFAULT_FEEDRATE = 1200.0
+# Matches pattern_generator.py's own --travel-feedrate CLI default -- kept a
+# separate constant/field from _DEFAULT_FEEDRATE since they control different
+# things: this is the fast move *between* heat locations, not the (derived,
+# not user-set) dwell speed *within* one, nor the pairs-CSV fallback feedrate.
+_DEFAULT_TRAVEL_FEEDRATE = 2000.0
 _POLL_MS = 100
 
 # Two unrelated CSV schemas can be dropped on the same "Sequence CSV" field:
@@ -127,8 +132,7 @@ def _arc_plot_points(
     A straight line between just the two endpoints badly misrepresents a
     circle's dwell rings -- each ring is only 2-3 waypoints apart (e.g. the
     two ends of a semicircle), so connecting them with straight chords draws
-    a flat zigzag instead of the actual curved path GRBL executes. Mirrors
-    the angle-sweep convention in sequence_runner._arc_length_mm.
+    a flat zigzag instead of the actual curved path GRBL executes.
     """
     cx, cy = x0 + i, y0 + j
     radius = math.hypot(i, j)
@@ -439,11 +443,24 @@ class MainWindow(QMainWindow):
 
         # -- Generator options --
         gen_gb = QGroupBox("Generator")
-        gen_layout = QHBoxLayout(gen_gb)
-        gen_layout.addWidget(QLabel("Feedrate:"))
+        gen_vbox = QVBoxLayout(gen_gb)
+        gen_layout = QHBoxLayout()
+        gen_layout.addWidget(QLabel("Pairs feedrate:"))
         self._feedrate_le = QLineEdit(str(_DEFAULT_FEEDRATE))
         self._feedrate_le.setMaximumWidth(70)
+        self._feedrate_le.setToolTip(
+            "Position-pairs CSVs only: fallback feedrate for rows with none."
+        )
         gen_layout.addWidget(self._feedrate_le)
+        gen_layout.addWidget(QLabel("Travel feedrate:"))
+        self._travel_feedrate_le = QLineEdit(str(_DEFAULT_TRAVEL_FEEDRATE))
+        self._travel_feedrate_le.setMaximumWidth(70)
+        self._travel_feedrate_le.setToolTip(
+            "Heat-locations CSVs only: fast feedrate for moving BETWEEN heat "
+            "locations. The dwell speed WITHIN a location is derived from its "
+            "radius/dwell_time_s and is not set here (see pattern_generator.py)."
+        )
+        gen_layout.addWidget(self._travel_feedrate_le)
         gen_layout.addWidget(QLabel("Transition (s):"))
         self._transition_le = QLineEdit("5.0")
         self._transition_le.setMaximumWidth(60)
@@ -454,6 +471,17 @@ class MainWindow(QMainWindow):
         self._loops_le.setMaximumWidth(50)
         gen_layout.addWidget(self._loops_le)
         gen_layout.addStretch()
+        gen_vbox.addLayout(gen_layout)
+        gen_hint = QLabel(
+            "Dwell feedrate (speed WITHIN a heat location) is always computed "
+            "automatically from path length ÷ dwell_time_s -- neither field "
+            "above sets it. Pairs feedrate only fills in missing values on a "
+            "position-pairs CSV; Travel feedrate only applies to the fast move "
+            "BETWEEN heat locations."
+        )
+        gen_hint.setStyleSheet("color: #888; font-style: italic;")
+        gen_hint.setWordWrap(True)
+        gen_vbox.addWidget(gen_hint)
         ctrl_layout.addWidget(gen_gb)
 
         # -- Cameras (recording and/or live preview -- independent rates) --
@@ -660,6 +688,7 @@ class MainWindow(QMainWindow):
     def _load_csv(self, path: Path) -> None:
         try:
             feedrate = float(self._feedrate_le.text() or _DEFAULT_FEEDRATE)
+            travel_feedrate = float(self._travel_feedrate_le.text() or _DEFAULT_TRAVEL_FEEDRATE)
             transition = float(self._transition_le.text() or 5.0)
             loops = max(1, int(self._loops_le.text() or 1))
         except ValueError as exc:
@@ -694,7 +723,7 @@ class MainWindow(QMainWindow):
             if csv_format == "pairs":
                 rows = generate_sequence_rows(specs)
             else:
-                rows = generate_heat_sequence(locations, travel_feedrate=feedrate)
+                rows = generate_heat_sequence(locations, travel_feedrate=travel_feedrate)
         except Exception as exc:
             QMessageBox.critical(self, "Generation Error", str(exc))
             return
@@ -898,8 +927,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._worker is not None and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(2000)
+            # _SequenceWorker overrides QThread.run() directly (no exec()), so
+            # quit() -- which only asks an event loop to exit -- is a no-op
+            # here. request_stop() is the actual cooperative-stop signal that
+            # run_sequence's loop checks, so it's the only thing that gets the
+            # heater/gantry through their real cleanup path instead of being
+            # abandoned mid-run when the window closes.
+            self._worker.request_stop()
+            self._worker.wait(8000)
         event.accept()
 
 

@@ -263,25 +263,34 @@ def generate_dwell_rows(loc: HeatLocation) -> list[SequenceRow]:
     if loc.dwell_time_s <= 0:
         return []
 
+    repeats = max(1, loc.repeats)
+
     if loc.shape == "rectangle":
         w = loc.width_mm if loc.width_mm > 0 else loc.radius_mm * 2.0
         h = loc.height_mm if loc.height_mm > 0 else loc.radius_mm * 2.0
         if w <= 0 or h <= 0:
             return []
-        passes = max(3, int(h / 2.0))  # ~2 mm line spacing
+        passes = max(3, int(h / 2.0))  # ~2 mm line spacing -- coverage density, not repeats
         segments = _linear_segments(_raster_points(loc.x, loc.y, w, h, passes=passes))
+        segments = segments * repeats
     elif loc.shape == "line":
         length = loc.width_mm if loc.width_mm > 0 else loc.radius_mm * 2.0
         if length <= 0:
             return []
-        passes = max(2, int(loc.dwell_time_s / 2.0))
+        # Each repeat is one full there-and-back traversal -- matches the
+        # "retrace the whole path N times" semantics used for circle/
+        # rectangle. An earlier version derived the pass count from
+        # dwell_time_s alone (~1 traversal per 2s), ignoring loc.repeats
+        # entirely and then multiplying that already-many-pass path by
+        # repeats again -- so "repeats=1" still produced many back-and-forth
+        # traversals with no way to ask for just one.
+        passes = 2 * repeats
         segments = _linear_segments(
             _line_points(loc.x, loc.y, length, angle_deg=loc.angle_deg, passes=passes)
         )
     else:
         segments = _ring_segments(loc.x, loc.y, loc.radius_mm, num_rings=loc.num_rings)
-
-    segments = segments * max(1, loc.repeats)
+        segments = segments * repeats
 
     total_dist = sum(seg.length_mm for seg in segments)
     if total_dist <= 0:

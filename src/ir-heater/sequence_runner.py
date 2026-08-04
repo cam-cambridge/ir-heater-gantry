@@ -444,9 +444,18 @@ class GrblController:
     def send_move(self, x: float, y: float, z: float, feedrate: float) -> None:
         """Queue a linear move to absolute coordinates (mm, G90)."""
         # Clamp to work area if limits are configured
-        x = max(0.0, min(x, self._x_max)) if self._x_max is not None else x
-        y = max(0.0, min(y, self._y_max)) if self._y_max is not None else y
-        z = max(0.0, min(z, self._z_max)) if self._z_max is not None else z
+        clamped_x = max(0.0, min(x, self._x_max)) if self._x_max is not None else x
+        clamped_y = max(0.0, min(y, self._y_max)) if self._y_max is not None else y
+        clamped_z = max(0.0, min(z, self._z_max)) if self._z_max is not None else z
+        if (clamped_x, clamped_y, clamped_z) != (x, y, z):
+            print(
+                f"WARNING: commanded move ({x:.3f}, {y:.3f}, {z:.3f}) exceeds the "
+                f"configured work area -- clamped to ({clamped_x:.3f}, {clamped_y:.3f}, "
+                f"{clamped_z:.3f}). The gantry will dwell at the clamped position, "
+                "not the CSV's original coordinate.",
+                flush=True,
+            )
+        x, y, z = clamped_x, clamped_y, clamped_z
 
         if self._last_feedrate != feedrate:
             resp1 = self._send_line(f"G1 F{feedrate:.2f}")
@@ -612,21 +621,6 @@ class GrblController:
         self._serial.close()
 
 
-def _arc_length_mm(x0: float, y0: float, x1: float, y1: float, i: float, j: float, cw: bool) -> float:
-    """Length (mm) of a G2/G3 arc from (x0,y0) to (x1,y1), center offset i/j from the start."""
-    cx, cy = x0 + i, y0 + j
-    radius = math.hypot(i, j)
-    if radius <= 1e-9:
-        return 0.0
-    if abs(x1 - x0) < 1e-6 and abs(y1 - y0) < 1e-6:
-        swept = 2 * math.pi  # start == end -> full circle
-    else:
-        start_angle = math.atan2(y0 - cy, x0 - cx)
-        end_angle = math.atan2(y1 - cy, x1 - cx)
-        swept = (start_angle - end_angle) % (2 * math.pi) if cw else (end_angle - start_angle) % (2 * math.pi)
-    return radius * swept
-
-
 def _parse_mpos(status: str) -> tuple[float, float] | None:
     """Extract (X, Y) from a GRBL ``?`` status report's MPos/WPos field."""
     for part in status.split("|"):
@@ -641,45 +635,59 @@ def _parse_mpos(status: str) -> tuple[float, float] | None:
 
 
 _DRIFT_CHECK_INTERVAL_S = 5.0
-_DRIFT_WARN_FRACTION = 0.5
-_DRIFT_MIN_EXPECTED_MM = 2.0
+_DRIFT_WARN_MM = 3.0
 
 
 def _check_motion_drift(
     printer: GrblController,
     now: float,
-    last_check_t: float,
-    last_check_pos: tuple[float, float] | None,
-    scheduled_distance_mm: float,
+    target_xy: tuple[float, float],
     metadata: RunMetadata | None,
-) -> tuple[float, tuple[float, float] | None, float]:
-    """Compare GRBL's real position movement against the schedule's implied
-    distance since the last check, and warn on substantial drift.
+) -> float:
+    """Compare GRBL's real position against where the schedule currently
+    expects it to be (``target_xy``, the most recently commanded step's
+    target), and warn if they've diverged by more than ``_DRIFT_WARN_MM``.
+
+    This is a *following-error* check -- actual position vs. the schedule's
+    target position at the same instant -- not a "distance covered per
+    window" check. An earlier version compared the schedule's *total path
+    length* traveled in a window (correctly summing arc + segment lengths)
+    against the *straight-line displacement* between two sampled points.
+    That comparison is only valid for a path that doesn't double back on
+    itself -- but every dwell pattern here does (a ring's two semicircle
+    arcs return near their start; a line or raster reverses direction
+    repeatedly), so a sampling window that happens to catch a
+    near-closed loop reports near-zero "coverage" even at perfect real
+    speed, while one that catches a half-loop reports a much higher
+    fraction -- false drift signals driven by the pattern's own geometry
+    and sampling phase, not by real hardware lag. Comparing like-for-like
+    positions instead sidesteps that entirely.
 
     Call this only every few seconds of wall-clock time (see
     ``_DRIFT_CHECK_INTERVAL_S``), never per-step -- a single extra ``?``
     query is cheap, but doing it on every fine-grained dwell segment would
     add serial round-trips right where timing is tightest.
 
-    Returns updated ``(last_check_t, last_check_pos, scheduled_distance_mm)``
-    for the caller to carry into the next window.
+    Returns the updated ``last_check_t`` for the caller to carry into the
+    next window.
     """
     status = printer.get_status()
     pos = _parse_mpos(status)
-    elapsed = now - last_check_t
-    if pos is not None and last_check_pos is not None and scheduled_distance_mm >= _DRIFT_MIN_EXPECTED_MM:
-        actual_mm = math.dist(last_check_pos, pos)
-        if actual_mm < scheduled_distance_mm * _DRIFT_WARN_FRACTION:
+    if pos is not None:
+        error_mm = math.dist(target_xy, pos)
+        if error_mm > _DRIFT_WARN_MM:
             msg = (
-                f"WARNING: motion drift -- gantry covered {actual_mm:.1f}mm in the "
-                f"last {elapsed:.1f}s, schedule expected ~{scheduled_distance_mm:.1f}mm. "
-                "Physical position may be lagging the commanded schedule (e.g. "
-                "dwell_time_s/feedrate too aggressive for the hardware)."
+                f"WARNING: motion drift -- gantry is {error_mm:.1f}mm from where "
+                f"the schedule currently expects it to be (target "
+                f"X{target_xy[0]:.2f} Y{target_xy[1]:.2f}, actual "
+                f"X{pos[0]:.2f} Y{pos[1]:.2f}). Physical position may be "
+                "lagging the commanded schedule (e.g. dwell_time_s/feedrate "
+                "too aggressive for the hardware)."
             )
             print(msg, flush=True)
             if metadata is not None:
                 metadata.drift_warnings.append(msg)
-    return now, (pos if pos is not None else last_check_pos), 0.0
+    return now
 
 
 def connect_dps(modbus_port: str, ini_path: Path, address: int, baudrate: int) -> Dps5005:
@@ -720,8 +728,6 @@ def run_sequence(
 
     # --- Periodic motion-drift verification state (see _check_motion_drift) ---
     drift_check_t = start_monotonic
-    drift_check_pos: tuple[float, float] | None = None
-    drift_scheduled_distance_mm = 0.0
 
     # --- Camera recording / live preview (separate process — never blocks
     # timing loop, and preview runs at its own rate independent of the
@@ -800,14 +806,6 @@ def run_sequence(
                 else:
                     printer.send_move(step.x, step.y, step.z, step.feedrate)
 
-            if is_arc:
-                drift_scheduled_distance_mm += _arc_length_mm(
-                    prev_x, prev_y, step.x, step.y, step.arc_i, step.arc_j, step.arc_cw
-                )
-            else:
-                drift_scheduled_distance_mm += math.dist(
-                    (prev_x, prev_y, prev_z), (step.x, step.y, step.z)
-                )
             prev_x, prev_y, prev_z = step.x, step.y, step.z
 
             print(
@@ -849,9 +847,8 @@ def run_sequence(
             if printer is not None and not dry_run:
                 now = time.perf_counter()
                 if (now - drift_check_t) >= _DRIFT_CHECK_INTERVAL_S:
-                    drift_check_t, drift_check_pos, drift_scheduled_distance_mm = _check_motion_drift(
-                        printer, now, drift_check_t, drift_check_pos,
-                        drift_scheduled_distance_mm, metadata,
+                    drift_check_t = _check_motion_drift(
+                        printer, now, (prev_x, prev_y), metadata,
                     )
     except Exception as exc:
         if metadata is not None:
