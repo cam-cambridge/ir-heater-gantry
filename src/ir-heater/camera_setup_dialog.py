@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from camera_controller import CameraSpec, _open_capture
+from camera_controller import CameraSpec, _configure_capture, _open_capture
 
 _PROBE_MAX_INDEX = 8
 _THUMB_W = 220
@@ -150,6 +150,11 @@ class CameraSetupDialog(QDialog):
             if not cap.isOpened():
                 cap.release()
                 continue
+            # Request a compressed capture format before the first read --
+            # this dialog probes (and keeps open) every responding index at
+            # once, so it's just as exposed to multi-camera USB bandwidth
+            # contention as CameraController is. See _DEFAULT_CAPTURE_FOURCC.
+            _configure_capture(cap)
             slot = _ProbeSlot(index, cap)
             if index in current_by_index:
                 slot.include_cb.setChecked(True)

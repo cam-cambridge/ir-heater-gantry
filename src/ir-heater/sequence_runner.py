@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -367,6 +367,33 @@ class GrblController:
         # lock directly instead -- this does NOT move the gantry, it just
         # tells GRBL to trust the current step position.
         self._clear_alarm()
+        self._ensure_wpos_reporting()
+
+    def _ensure_wpos_reporting(self) -> None:
+        """Force ``$10=2`` so ``?`` status reports show ``WPos`` (work
+        position) instead of GRBL's factory-default ``MPos`` (raw machine
+        position).
+
+        This software's *only* origin/zero mechanism is ``set_zero``
+        (``G92``, see its docstring) -- there's no homing. ``G92`` only
+        offsets ``WPos``; ``MPos`` is unaffected by it. If the controller is
+        left on its default ``$10=1`` (MPos), every "Zero Here" in the align
+        GUI would silently do nothing to the reported/displayed position,
+        and worse, ``run_sequence``'s motion-drift check (which compares the
+        live position against a target that *is* in the zeroed/work frame)
+        would report a constant false drift equal to the zero offset on
+        every run. ``$10`` is a persisted (non-volatile) GRBL setting, so
+        this just re-asserts the value this software needs every connect,
+        regardless of what was last configured on the controller.
+        """
+        resp = self._send_line("$10=2")
+        if "error" in resp:
+            print(
+                f"WARNING: could not set $10=2 (WPos status reporting): {resp}. "
+                "Position readout and motion-drift checks may not reflect "
+                "G92 zero offsets correctly.",
+                flush=True,
+            )
 
     def _clear_alarm(self) -> None:
         """Clear an Alarm lock with ``$X`` if GRBL is currently in one.
@@ -634,6 +661,46 @@ def _parse_mpos(status: str) -> tuple[float, float] | None:
     return None
 
 
+def _with_live_first_step_timing(
+    steps: list[SequenceStep], printer: GrblController,
+) -> list[SequenceStep]:
+    """Replace the first step's ``time_s`` with one computed from GRBL's
+    actual current position, if that's longer than what's already there.
+
+    ``pattern_generator.generate_heat_sequence`` has no live connection to
+    query at CSV-generation time, so when its caller doesn't supply a
+    ``start_position`` it falls back to a fixed 0.5s guess for the very
+    first move regardless of the real distance (see its docstring). If the
+    gantry is actually far from that first target -- e.g. a previous run's
+    return-to-origin move didn't fully complete -- the software then waits
+    only 0.5s before sending the next several lines while GRBL is still
+    physically completing a much longer first move. Each of those extra
+    lines still gets queued (GRBL's planner buffer has room for more than
+    one), but if the backlog keeps growing across several understated
+    steps, GRBL eventually stops returning ``ok`` for new lines until a
+    queue slot frees up -- which looks like a silent ``_send_line``
+    timeout several steps later, not on the first (undertimed) one itself.
+    Recomputing the first step's duration from where GRBL actually is
+    closes that gap at its source.
+
+    Never *shortens* the original time_s -- only lengthens it if the real
+    distance needs more time than the CSV already budgeted, since the
+    original value may have been a deliberately slow first move.
+    """
+    if not steps:
+        return steps
+    pos = _parse_mpos(printer.get_status())
+    if pos is None:
+        return steps
+    first = steps[0]
+    if first.feedrate <= 0:
+        return steps
+    real_time_s = math.dist(pos, (first.x, first.y)) * 60.0 / first.feedrate
+    if real_time_s <= first.time_s:
+        return steps
+    return [replace(first, time_s=real_time_s)] + steps[1:]
+
+
 _DRIFT_CHECK_INTERVAL_S = 5.0
 _DRIFT_WARN_MM = 3.0
 
@@ -717,6 +784,9 @@ def run_sequence(
 
     if not dry_run and dps is None:
         raise ValueError("dps instance is required when dry_run is False")
+
+    if printer is not None and not dry_run:
+        steps = _with_live_first_step_timing(steps, printer)
 
     home_step: SequenceStep | None = steps[0] if steps else None
     previous_t = 0.0
@@ -910,20 +980,49 @@ def run_sequence(
         # --- Return to a known position and release the serial port ---
         if printer is not None:
             try:
+                final_xyz: tuple[float, float, float] | None = None
+                final_feedrate = 1200.0
                 if return_to_origin:
                     print(
                         "Moving to origin: X=0.000 Y=0.000 Z=0.000",
                         flush=True,
                     )
-                    origin_feedrate = home_step.feedrate if home_step is not None else 1200.0
-                    printer.send_move(0.0, 0.0, 0.0, origin_feedrate)
+                    final_xyz = (0.0, 0.0, 0.0)
+                    final_feedrate = home_step.feedrate if home_step is not None else 1200.0
+                    printer.send_move(*final_xyz, final_feedrate)
                 elif home_step is not None:
+                    final_xyz = (home_step.x, home_step.y, home_step.z)
+                    final_feedrate = home_step.feedrate
                     print(
                         f"Moving to initial position: "
-                        f"X={home_step.x:.3f} Y={home_step.y:.3f} Z={home_step.z:.3f}",
+                        f"X={final_xyz[0]:.3f} Y={final_xyz[1]:.3f} Z={final_xyz[2]:.3f}",
                         flush=True,
                     )
-                    printer.send_move(home_step.x, home_step.y, home_step.z, home_step.feedrate)
+                    printer.send_move(*final_xyz, final_feedrate)
+
+                if final_xyz is not None:
+                    # send_move only confirms GRBL *accepted* the line into
+                    # its queue, not that the move physically finished.
+                    # Disconnecting right after that (the old behavior)
+                    # could cut the port while the gantry is still
+                    # traveling, stranding it short of the intended final
+                    # position -- which then becomes the *next* run's
+                    # (wrong) idea of where it's starting from. Block here
+                    # until GRBL reports it's actually stopped, sized to
+                    # the move's own real distance/feedrate rather than a
+                    # flat guess.
+                    dist = math.dist((prev_x, prev_y, prev_z), final_xyz)
+                    move_timeout = max(10.0, dist * 60.0 / final_feedrate + 5.0)
+                    if not printer.wait_for_hold(timeout_s=move_timeout):
+                        print(
+                            "WARNING: gantry did not confirm it reached the "
+                            f"final position ({final_xyz[0]:.3f}, {final_xyz[1]:.3f}, "
+                            f"{final_xyz[2]:.3f}) within {move_timeout:.1f}s -- it "
+                            "may have stopped short. The next run measures its "
+                            "actual starting position live, but double-check the "
+                            "physical position before trusting it.",
+                            flush=True,
+                        )
             except Exception as exc:
                 print(f"WARNING: failed to return gantry to a safe position: {exc}", flush=True)
             finally:

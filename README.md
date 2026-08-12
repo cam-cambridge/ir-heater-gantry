@@ -27,14 +27,15 @@ pattern generation, and a manual alignment/jog interface.
 # Install dependencies
 uv sync
 
-# Launch the main sequence GUI
-uv run main.py gui
+# Design heat-location grids visually
+uv run main.py pattern-gui
 
 # Manual alignment with live camera preview
 uv run main.py align
 
-# Design heat-location grids visually
-uv run main.py pattern-gui
+# Launch the main sequence GUI
+uv run main.py gui
+
 ```
 
 ## Reproducibility
@@ -278,11 +279,39 @@ pillow>=12.1.1         # Image support
   unlocked.  Since homing is disabled, `GrblController` clears this lock with
   `$X` right after connecting (this does **not** move the gantry — it just
   tells GRBL to trust the current step position).
+- Since there's no homing, the *only* origin/zero mechanism is `G92`
+  (`GrblController.set_zero`, wired to the align GUI's **Zero Here**
+  button) — see its docstring for why it's not persisted across resets.
+  `G92` only offsets **WPos** (work position), not **MPos** (raw machine
+  position), and GRBL's factory default (`$10=1`) reports MPos — which
+  would make every "Zero Here" invisible to both the position readout and
+  `run_sequence`'s motion-drift check. `GrblController` forces `$10=2`
+  (report WPos) right after connecting for this reason.
 - Every command sent to GRBL (`_send_line`) has a bounded 10s timeout and
   raises `TimeoutError` instead of blocking forever if a reply never
   arrives (e.g. a dropped byte on a flaky link). The `align` GUI's jog/go-to
   buttons call GRBL directly on the main Qt thread, so an unbounded wait
   there used to freeze the entire window until the process was killed.
+- `pattern_generator.generate_heat_sequence` has no live GRBL connection at
+  CSV-generation time, so without an explicit `start_position` it guesses a
+  fixed 0.5s for the very first move regardless of the real distance. If
+  the gantry is actually far from that first target, `run_sequence` used to
+  wait only 0.5s before sending several more lines while GRBL was still
+  physically completing a much longer move — the backlog this creates in
+  GRBL's planner buffer can eventually stall `ok` replies several steps
+  later, surfacing as an unrelated-looking `_send_line` timeout. Since
+  `run_sequence` *does* have a live connection right when a run starts, it
+  now queries GRBL's actual position there and recomputes the first step's
+  timing from the real distance (`_with_live_first_step_timing`) before
+  anything else. It only ever lengthens the guess, never shortens it.
+- The end-of-run "return to origin / initial position" move used to
+  disconnect immediately after GRBL accepted the line (`ok`), not after it
+  physically finished — closing the port mid-travel could strand the
+  gantry short of the intended final position, which then became the
+  *next* run's (wrong) idea of where it was starting from. `run_sequence`
+  now waits (`wait_for_hold`, timed to the move's own distance/feedrate)
+  for GRBL to actually stop before disconnecting, and warns if it doesn't
+  confirm in time.
 
 ## Motion-drift verification
 
@@ -355,3 +384,24 @@ On the CLI, use repeatable `--camera LABEL:INDEX` flags:
 uv run main.py run --list-cameras                        # which indices respond
 uv run main.py run --camera top:0 --camera side:1 ...     # record from both
 ```
+
+### Only one camera streams at a time
+
+Two or more USB cameras opening fine but only one ever showing a live frame
+is almost always a **USB bandwidth or power budget problem**, not a software
+bug — the second camera is losing an arbitration fight with the first over
+a shared hub/host controller. `camera_config.ini`'s `capture_fourcc: MJPG`
+(the default) asks each camera for its compressed stream instead of raw
+YUY2/uncompressed, which cuts required bandwidth roughly 10x and is usually
+enough on its own. If it isn't:
+
+- Put each camera on a **separate USB controller/port**, not the same hub —
+  on most PCs/laptops that means physically different ports, not just
+  different hub downstream ports.
+- If using a hub, use a **powered** one; bus-powered hubs often can't supply
+  enough current for two active webcams at once.
+- Lower `capture_width`/`capture_height` in `camera_config.ini`.
+
+A camera that opens but then never delivers a frame for `stall_timeout`
+seconds (default 5s) now shows an explicit error in the preview panel
+instead of sitting on "(not connected)" forever with no explanation.

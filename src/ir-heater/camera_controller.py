@@ -45,6 +45,32 @@ _DEFAULT_FOURCC = "mp4v"
 _DEFAULT_JOIN_TIMEOUT = 2.0
 _DEFAULT_MIN_FPS = 0.1
 _DEFAULT_FPS = 15.0
+# Requested *input* format from the camera itself (distinct from
+# _DEFAULT_FOURCC, which is the *output* video file codec). OpenCV's
+# default UVC request is often an uncompressed format (e.g. YUYV), which
+# for two or more USB cameras sharing one host controller can exceed the
+# shared isochronous bandwidth budget -- the camera(s) after the first
+# then open fine (isOpened() succeeds) but never deliver a frame. MJPG is
+# compressed on the camera's own USB controller, cutting required
+# bandwidth by roughly an order of magnitude, and is supported by nearly
+# all UVC webcams. See _open_capture / _CameraThread._open.
+_DEFAULT_CAPTURE_FOURCC = "MJPG"
+# How long a camera is allowed to sit open-but-frameless before it's
+# reported as an error instead of silently retrying forever (see
+# _CameraThread._loop).
+_DEFAULT_STALL_TIMEOUT = 5.0
+
+# CameraController.start_preview() launches one thread per camera, and each
+# thread opens its own cv2.VideoCapture concurrently. On Linux, OpenCV's
+# V4L2/GStreamer backends aren't reliably safe against *concurrent*
+# construction from multiple threads -- device/plugin-registry
+# initialization can race and segfault the whole process (observed as an
+# Ubuntu "python has stopped working" report while the align GUI's cameras
+# are loading, which then doesn't recur once every camera is past open() and
+# only reading frames). Serializing the open() calls across threads with
+# this lock removes the race; it does not serialize the read loops
+# themselves, so it costs a little startup latency, not steady-state fps.
+_open_lock = threading.Lock()
 
 CameraSpec = tuple[str, int]  # (label, device_id)
 
@@ -85,6 +111,28 @@ def _open_capture(cam_id: int, attempts: int = 3, retry_delay: float = 0.4) -> c
     return cap
 
 
+def _configure_capture(
+    cap: cv2.VideoCapture,
+    fourcc: str | None = _DEFAULT_CAPTURE_FOURCC,
+    width: int | None = None,
+    height: int | None = None,
+) -> None:
+    """Best-effort request of input format/resolution on an already-open capture.
+
+    Must be called before the first ``read()``. Every call here is a
+    request, not a guarantee -- cameras/backends that don't support the
+    requested format just silently keep their native one, so this never
+    raises. See ``_DEFAULT_CAPTURE_FOURCC`` for why the fourcc request in
+    particular matters for multi-camera USB bandwidth.
+    """
+    if fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+    if width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+
 def _load_camera_config(config_path: Path | None = None) -> dict[str, str]:
     """Load camera defaults from an INI-style file, falling back to built-in values."""
     if config_path is None:
@@ -95,9 +143,21 @@ def _load_camera_config(config_path: Path | None = None) -> dict[str, str]:
     with config_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.split("#", 1)[0].strip()
-            if not line or "=" not in line:
+            if not line:
                 continue
-            key, _, val = line.partition("=")
+            # camera_config.ini has always used "key: value" (colon); an
+            # earlier version of this parser only recognised "=", which
+            # meant every setting in the file silently did nothing and
+            # every value fell back to the hardcoded default regardless of
+            # what was written here. Accept whichever separator appears
+            # first so both conventions work.
+            eq_pos = line.find("=")
+            colon_pos = line.find(":")
+            positions = [p for p in (eq_pos, colon_pos) if p != -1]
+            if not positions:
+                continue
+            sep_pos = min(positions)
+            key, val = line[:sep_pos], line[sep_pos + 1 :]
             result[key.strip()] = val.strip().strip('"').strip("'")
     return result
 
@@ -114,6 +174,10 @@ class _CameraThread:
         min_fps: float = _DEFAULT_MIN_FPS,
         join_timeout: float = _DEFAULT_JOIN_TIMEOUT,
         on_error: Callable[[str, str], None] | None = None,
+        capture_fourcc: str | None = _DEFAULT_CAPTURE_FOURCC,
+        capture_width: int | None = None,
+        capture_height: int | None = None,
+        stall_timeout: float = _DEFAULT_STALL_TIMEOUT,
     ) -> None:
         self._id = cam_id
         self._fps = fps
@@ -121,6 +185,10 @@ class _CameraThread:
         self._fourcc = fourcc
         self._join_timeout = join_timeout
         self._on_error = on_error
+        self._capture_fourcc = capture_fourcc
+        self._capture_width = capture_width
+        self._capture_height = capture_height
+        self._stall_timeout = stall_timeout
         self._cap: cv2.VideoCapture | None = None
         self._lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
@@ -135,11 +203,19 @@ class _CameraThread:
 
     # ------------------------------------------------------------------
     def _open(self) -> None:
-        self._cap = _open_capture(self._id)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {self._id} ({self._label})")
-        # Try to set requested FPS (best-effort; many USB cameras ignore this)
-        self._cap.set(_CV2_CAP_PROP_FPS, self._fps)
+        # See _open_lock: holding it across construction + initial config
+        # keeps two camera threads from constructing a VideoCapture at the
+        # same instant, which is the crash risk. Reads afterward proceed
+        # unlocked/concurrently as before.
+        with _open_lock:
+            self._cap = _open_capture(self._id)
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Cannot open camera {self._id} ({self._label})")
+            _configure_capture(
+                self._cap, self._capture_fourcc, self._capture_width, self._capture_height
+            )
+            # Try to set requested FPS (best-effort; many USB cameras ignore this)
+            self._cap.set(_CV2_CAP_PROP_FPS, self._fps)
 
     def _loop(self) -> None:
         try:
@@ -155,12 +231,39 @@ class _CameraThread:
             return
 
         last_write = 0.0
+        # Tracks how long we've gone without a single successful read since
+        # open (or since the last successful one) -- distinct from the open
+        # failure above. A camera can open fine (isOpened() True) yet never
+        # deliver a frame if it lost a USB bandwidth/power arbitration
+        # fight with another camera on the same hub/controller; without
+        # this, that case retries silently forever and just looks like
+        # "not connected" with no explanation (see _DEFAULT_CAPTURE_FOURCC).
+        no_frame_since = time.perf_counter()
+        stalled = False
         try:
             while self._running:
                 ok, frame = self._cap.read()  # type: ignore[union-attr]
                 if not ok:
+                    if not stalled and (time.perf_counter() - no_frame_since) >= self._stall_timeout:
+                        stalled = True
+                        self._error = (
+                            f"Camera opened but produced no frames for "
+                            f"{self._stall_timeout:.0f}s -- likely USB bandwidth "
+                            "or power contention with another camera on the same "
+                            "hub/controller. Try a separate USB controller/port, "
+                            "a powered hub, or lowering resolution/fps."
+                        )
+                        if self._on_error is not None:
+                            self._on_error(self._label, self._error)
                     time.sleep(0.01)
                     continue
+
+                no_frame_since = time.perf_counter()
+                if stalled:
+                    # Recovered -- clear the error so the GUI stops showing
+                    # a stale warning for a camera that's streaming fine now.
+                    stalled = False
+                    self._error = None
 
                 with self._lock:
                     self._latest_frame = frame
@@ -286,12 +389,18 @@ class CameraController:
         fourcc = cfg.get("fourcc", _DEFAULT_FOURCC)
         min_fps = float(cfg.get("min_fps", _DEFAULT_MIN_FPS))
         join_timeout = float(cfg.get("join_timeout", _DEFAULT_JOIN_TIMEOUT))
+        capture_fourcc = cfg.get("capture_fourcc", _DEFAULT_CAPTURE_FOURCC) or None
+        capture_width = int(cfg["capture_width"]) if cfg.get("capture_width") else None
+        capture_height = int(cfg["capture_height"]) if cfg.get("capture_height") else None
+        stall_timeout = float(cfg.get("stall_timeout", _DEFAULT_STALL_TIMEOUT))
 
         self._specs: list[CameraSpec] = list(cameras)
         self._threads: dict[str, _CameraThread] = {
             label: _CameraThread(
                 cam_id, fps, label, fourcc=fourcc,
                 min_fps=min_fps, join_timeout=join_timeout, on_error=on_error,
+                capture_fourcc=capture_fourcc, capture_width=capture_width,
+                capture_height=capture_height, stall_timeout=stall_timeout,
             )
             for label, cam_id in cameras
         }
@@ -475,6 +584,10 @@ class CameraRecorderProcess(multiprocessing.Process):
         preview_queue: multiprocessing.Queue | None = None,
         preview_fps: float = _DEFAULT_FPS,
         preview_max_width: int = 480,
+        capture_fourcc: str | None = _DEFAULT_CAPTURE_FOURCC,
+        capture_width: int | None = None,
+        capture_height: int | None = None,
+        stall_timeout: float = _DEFAULT_STALL_TIMEOUT,
     ) -> None:
         super().__init__(daemon=True, name="cam-recorder")
         self._cameras = list(cameras)
@@ -486,6 +599,10 @@ class CameraRecorderProcess(multiprocessing.Process):
         self._preview_queue = preview_queue
         self._preview_fps = preview_fps
         self._preview_max_width = preview_max_width
+        self._capture_fourcc = capture_fourcc
+        self._capture_width = capture_width
+        self._capture_height = capture_height
+        self._stall_timeout = stall_timeout
 
     def run(self) -> None:
         labels = [label for label, _ in self._cameras]
@@ -520,8 +637,20 @@ class CameraRecorderProcess(multiprocessing.Process):
                 if not cap.isOpened():
                     self._result_queue.put(("error", f"Cannot open camera {cam_id} ({label})"))
                     return
+                _configure_capture(
+                    cap, self._capture_fourcc, self._capture_width, self._capture_height
+                )
                 cap.set(cv2.CAP_PROP_FPS, capture_fps)
                 caps.append(cap)
+
+            # Per-camera stall tracking (see _CameraThread._loop for why this
+            # matters -- a camera can open fine but never deliver a frame if
+            # it lost a USB bandwidth/power fight with another camera).
+            # Timers start lazily on each camera's first actual read attempt
+            # below, not here, since recording/preview may not start capturing
+            # frames until well after "ready" is signalled.
+            no_frame_since: list[float | None] = [None] * len(caps)
+            stalled: list[bool] = [False] * len(caps)
 
             # Signal "cameras open, ready to capture" independent of whether
             # recording was requested -- the "started" message below only
@@ -608,6 +737,24 @@ class CameraRecorderProcess(multiprocessing.Process):
                     frames.append(frame if ok else None)
 
                 now = time.perf_counter()
+
+                # --- Per-camera stall detection ---
+                for i, frame in enumerate(frames):
+                    if frame is not None:
+                        no_frame_since[i] = now
+                        stalled[i] = False
+                        continue
+                    if no_frame_since[i] is None:
+                        no_frame_since[i] = now
+                    elif not stalled[i] and (now - no_frame_since[i]) >= self._stall_timeout:
+                        stalled[i] = True
+                        self._result_queue.put((
+                            "error",
+                            f"Camera {labels[i]!r} opened but produced no frames for "
+                            f"{self._stall_timeout:.0f}s -- likely USB bandwidth/power "
+                            "contention with another camera (try a separate USB "
+                            "controller/port, a powered hub, or lowering resolution/fps).",
+                        ))
 
                 # --- Throttled write to disk -- independent of preview rate ---
                 if recording and (now - last_record_write) >= record_interval:
