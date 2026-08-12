@@ -210,6 +210,12 @@ class _SequenceWorker(QThread):
         record_dir: str,
         live_preview: bool = False,
         preview_fps: float = 15.0,
+        apply_saved_zero: bool = False,
+        loops: int = 1,
+        cycle_delay_s: float = 0.0,
+        csv_format: str = "",
+        source_csv_path: str = "",
+        generated_csv_path: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -218,6 +224,12 @@ class _SequenceWorker(QThread):
         self._time_mode = time_mode
         self._dry_run = dry_run
         self._return_to_origin = return_to_origin
+        self._apply_saved_zero = apply_saved_zero
+        self._loops = loops
+        self._cycle_delay_s = cycle_delay_s
+        self._csv_format = csv_format
+        self._source_csv_path = source_csv_path
+        self._generated_csv_path = generated_csv_path
         self._modbus_port = modbus_port
         self._modbus_addr = modbus_addr
         self._modbus_baud = modbus_baud
@@ -266,6 +278,22 @@ class _SequenceWorker(QThread):
                         y_max=self._y_max,
                         z_max=self._z_max,
                     )
+                    if self._apply_saved_zero:
+                        # This connection just went through its own reset
+                        # (see GrblController.__init__), which lost whatever
+                        # G92 zero was set in the align GUI. The user opted
+                        # into this checkbox explicitly, so treat that as
+                        # the confirmation reapply_saved_zero's docstring
+                        # calls for -- only correct if the controller was
+                        # never powered off between the align session and
+                        # this run.
+                        if not printer.reapply_saved_zero():
+                            print(
+                                "WARNING: 'Apply saved zero before run' was checked, "
+                                "but no saved zero was found -- running against "
+                                "whatever position GRBL considers (0,0,0) right now.",
+                                flush=True,
+                            )
 
             recording = self._record_cameras and self._record_dir and self._camera_specs
             if self._camera_specs and (recording or self._live_preview):
@@ -278,6 +306,11 @@ class _SequenceWorker(QThread):
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             metadata = RunMetadata(
                 run_id=run_id,
+                csv_file=self._generated_csv_path,
+                csv_format=self._csv_format,
+                source_csv=self._source_csv_path,
+                loops=self._loops,
+                cycle_delay_s=self._cycle_delay_s,
                 time_mode=self._time_mode,
                 dry_run=self._dry_run,
                 return_to_origin=self._return_to_origin,
@@ -312,6 +345,11 @@ class _SequenceWorker(QThread):
                 live_preview=self._live_preview,
                 preview_queue=self.preview_queue,
                 preview_fps=self._preview_fps,
+                loops=self._loops,
+                cycle_delay_s=self._cycle_delay_s,
+                sequence_csv_path=(
+                    Path(self._generated_csv_path) if self._generated_csv_path else None
+                ),
             )
         except Exception as exc:
             self.error.emit(str(exc))
@@ -331,6 +369,9 @@ class MainWindow(QMainWindow):
 
         self._looped_steps: list[SequenceStep] = []
         self._generated_csv_path: Path | None = None
+        self._source_csv_path: Path | None = None
+        self._csv_format: str = ""
+        self._gen_loops: int = 1
         self._worker: _SequenceWorker | None = None
         self._total_steps = 1
 
@@ -470,6 +511,14 @@ class MainWindow(QMainWindow):
         self._loops_le = QLineEdit("1")
         self._loops_le.setMaximumWidth(50)
         gen_layout.addWidget(self._loops_le)
+        gen_layout.addWidget(QLabel("Cycle delay (s):"))
+        self._cycle_delay_le = QLineEdit("0")
+        self._cycle_delay_le.setMaximumWidth(60)
+        self._cycle_delay_le.setToolTip(
+            "Pause this many seconds between repeats of the grid when Loops > 1 "
+            "(the gantry/heater just hold at the end of one pass; no-op for Loops 1)."
+        )
+        gen_layout.addWidget(self._cycle_delay_le)
         gen_layout.addStretch()
         gen_vbox.addLayout(gen_layout)
         gen_hint = QLabel(
@@ -538,6 +587,18 @@ class MainWindow(QMainWindow):
         self._return_cb = QCheckBox("Return to 0,0,0 after run")
         self._return_cb.setChecked(True)
         seq_layout.addWidget(self._return_cb)
+        self._apply_saved_zero_cb = QCheckBox("Apply saved zero before run")
+        self._apply_saved_zero_cb.setToolTip(
+            "Restore the zero mark last set with \"Zero Here\" in the "
+            "Alignment tool -- this run opens its own fresh GRBL connection, "
+            "which otherwise starts from whatever position GRBL currently "
+            "considers (0,0,0).\n\n"
+            "Only check this if the controller has stayed powered "
+            "continuously since that zero was set. A power-cycle since then "
+            "makes this silently wrong -- re-zero via the Alignment tool "
+            "first instead."
+        )
+        seq_layout.addWidget(self._apply_saved_zero_cb)
         seq_layout.addStretch()
 
         # Run / Stop
@@ -746,6 +807,9 @@ class MainWindow(QMainWindow):
             return
 
         self._generated_csv_path = output_path
+        self._source_csv_path = path
+        self._csv_format = csv_format
+        self._gen_loops = loops
         self._total_steps = max(len(self._looped_steps), 1)
         self._progress_bar.setMaximum(self._total_steps)
         self._plot_planned(self._looped_steps)
@@ -831,6 +895,14 @@ class MainWindow(QMainWindow):
         record_dir = self._record_dir_le.text().strip() if self._record_cb.isChecked() else ""
         cam_fps = float(self._cam_fps_le.text() or 15)
         preview_fps = float(self._preview_fps_le.text() or 15)
+        try:
+            cycle_delay_s = float(self._cycle_delay_le.text() or 0)
+        except ValueError:
+            QMessageBox.critical(self, "Input Error", "Cycle delay must be a number.")
+            return
+        if cycle_delay_s < 0:
+            QMessageBox.critical(self, "Input Error", "Cycle delay must be >= 0.")
+            return
 
         self._worker = _SequenceWorker(
             steps=self._looped_steps,
@@ -851,6 +923,12 @@ class MainWindow(QMainWindow):
             record_dir=record_dir,
             live_preview=self._live_preview_cb.isChecked(),
             preview_fps=preview_fps,
+            apply_saved_zero=self._apply_saved_zero_cb.isChecked(),
+            loops=self._gen_loops,
+            cycle_delay_s=cycle_delay_s,
+            csv_format=self._csv_format,
+            source_csv_path=str(self._source_csv_path) if self._source_csv_path else "",
+            generated_csv_path=str(self._generated_csv_path) if self._generated_csv_path else "",
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)

@@ -12,3 +12,6 @@ wheels/
 #recordings and data
 recordings/
 run_metadata*
+
+# Persisted GRBL zero mark (machine-specific runtime state, see GrblController.set_zero)
+src/ir-heater/grbl_zero_state.json

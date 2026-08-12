@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import multiprocessing
+import shutil
 import sys
 import threading
 import time
@@ -48,7 +49,12 @@ class RunMetadata:
 
     # Inputs
     csv_file: str = ""
+    csv_format: str = ""  # "raw" (CLI: --csv passed straight in) | "pairs" | "locations"
+    source_csv: str = ""  # the small CSV the user picked before generation/looping (GUI runs).
+    csv_copy: str = ""  # duplicate of csv_file saved next to this metadata file -- see save_run_metadata.
     loops: int = 1
+    cycle_delay_s: float = 0.0  # pause between repeats of the full grid/cycle; see run_sequence.
+    steps_per_cycle: int = 0  # len(steps) / loops, i.e. steps in one pass through the grid.
     time_mode: str = "step"
     default_feedrate: float = 1200.0
     dry_run: bool = False
@@ -267,6 +273,28 @@ def find_grbl_port(
     return None
 
 
+# Where a "Zero Here" is persisted so a *later* connection (a genuine
+# reconnect, or the separate connection the main run GUI opens) can offer to
+# restore the same physical zero mark. See GrblController.set_zero /
+# reapply_saved_zero for the math and the power-cycle caveat -- this file is
+# only meaningful for as long as the controller has stayed continuously
+# powered since it was written.
+_ZERO_STATE_PATH = Path(__file__).with_name("grbl_zero_state.json")
+
+
+def _parse_position_xyz(status: str) -> tuple[float, float, float] | None:
+    """Extract (X, Y, Z) from a GRBL ``?`` status report's MPos/WPos field."""
+    for part in status.split("|"):
+        if part.startswith("MPos:") or part.startswith("WPos:"):
+            coords = part.split(":", 1)[1].split(",")
+            if len(coords) >= 3:
+                try:
+                    return float(coords[0]), float(coords[1]), float(coords[2])
+                except ValueError:
+                    return None
+    return None
+
+
 class GrblController:
     """Communicates with a GRBL-based CNC/laser controller via raw serial.
 
@@ -357,6 +385,13 @@ class GrblController:
         self._y_max = y_max
         self._z_max = z_max
         self._last_feedrate: float | None = None
+        # The G92 offset currently in effect, tracked in software since GRBL
+        # only reports WPos/MPos, not the offset itself. Always (0,0,0)
+        # right here -- the reset this __init__ just went through (banner or
+        # forced soft-reset) clears any previous G92, same as set_zero's
+        # docstring explains. Kept updated by set_zero() so raw/absolute
+        # position can be recovered later (see reapply_saved_zero).
+        self._applied_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
         print(f"Connected to {banner.decode(errors='replace').strip()}", flush=True)
 
@@ -556,13 +591,81 @@ class GrblController:
         the moment of a reset (power-on, or the soft-reset this class issues
         on connect) is (0,0,0), which may not be true.
 
-        The offset is **not persisted** -- it's lost on the next reset the
-        same way GRBL's whole position model is, so it must be re-applied
-        each time a fresh connection is made if it's still needed.
+        The offset itself is **not persisted by GRBL** -- it's lost on the
+        next reset the same way GRBL's whole position model is, so it must
+        be re-applied each time a fresh connection is made if it's still
+        needed. This method separately writes it to a small state file (see
+        ``reapply_saved_zero``) so a *later* connection can restore the same
+        physical mark automatically, but that restore is only valid if the
+        controller was never fully powered off in between -- see that
+        method's docstring.
         """
+        pos_before = _parse_position_xyz(self.get_status())
         resp = self._send_line(f"G92 X{x:.3f} Y{y:.3f} Z{z:.3f}")
         if "error" in resp:
             print(f"GRBL error setting zero: {resp}", flush=True)
+            return
+        if pos_before is not None:
+            # raw = the absolute/uncalibrated position GRBL would call MPos,
+            # recovered from the just-reported WPos plus whatever offset was
+            # in effect *before* this call (both in the same frame, since
+            # neither has moved between the status query above and the G92
+            # taking effect). This is the value that stays meaningful across
+            # a soft-reset/reconnect (unlike WPos, which resets to 0 offset
+            # each time) -- see reapply_saved_zero.
+            raw = tuple(p + o for p, o in zip(pos_before, self._applied_offset))
+            self._applied_offset = (raw[0] - x, raw[1] - y, raw[2] - z)
+            self._save_zero_state(self._applied_offset)
+
+    @staticmethod
+    def _save_zero_state(offset: tuple[float, float, float]) -> None:
+        try:
+            _ZERO_STATE_PATH.write_text(
+                json.dumps({"offset_xyz": list(offset)}), encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"WARNING: could not save zero state to {_ZERO_STATE_PATH}: {exc}", flush=True)
+
+    def has_saved_zero(self) -> bool:
+        """Whether a previously-saved zero mark exists on disk to reapply."""
+        return _ZERO_STATE_PATH.exists()
+
+    def reapply_saved_zero(self) -> bool:
+        """Restore the physical zero mark last set by ``set_zero`` (e.g. via
+        the align GUI's "Zero Here"), even though this is a fresh connection
+        that already lost GRBL's own G92 offset.
+
+        Works because GRBL's *raw* position tracking (what it calls MPos) is
+        derived from the stepper step count and survives a soft-reset --
+        only the G92 work offset itself gets cleared. So the saved offset
+        plus the live raw position is enough to recompute and resend an
+        equivalent G92, reproducing the exact same physical reference point.
+
+        .. warning::
+            This is only correct if the controller has been continuously
+            powered since the zero was saved. A real power-cycle resets
+            GRBL's raw position tracking too (there's no homing hardware
+            here to re-anchor it), which silently invalidates the saved
+            offset -- reapplying it then would zero to the wrong physical
+            spot. Callers must only invoke this when they can vouch the
+            controller was never powered off in between, and should treat it
+            as a deliberate, confirmed action rather than an automatic one.
+
+        Returns ``False`` (does nothing) if no saved zero exists or the
+        state file can't be read; ``True`` if it was reapplied.
+        """
+        try:
+            saved = json.loads(_ZERO_STATE_PATH.read_text(encoding="utf-8"))
+            offset_saved = tuple(float(v) for v in saved["offset_xyz"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        pos_now = _parse_position_xyz(self.get_status())
+        if pos_now is None:
+            return False
+        raw_now = tuple(p + o for p, o in zip(pos_now, self._applied_offset))
+        target = tuple(r - o for r, o in zip(raw_now, offset_saved))
+        self.set_zero(*target)
+        return True
 
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
@@ -778,7 +881,28 @@ def run_sequence(
     live_preview: bool = False,
     preview_queue: multiprocessing.Queue | None = None,
     preview_fps: float = 15.0,
+    loops: int = 1,
+    cycle_delay_s: float = 0.0,
+    sequence_csv_path: Path | None = None,
 ) -> None:
+    """Run *steps* against the hardware (or in ``dry_run``/planning-only mode).
+
+    ``loops``/``cycle_delay_s``: *steps* is already the fully expanded,
+    flattened list (one full pass through the grid repeated ``loops`` times
+    back-to-back -- see ``expand_loop_steps`` and the GUI's own ``rows *
+    loops``), not something this function loops over itself. What it *does*
+    do with ``loops`` is locate the boundary between one pass and the next
+    (``len(steps) // loops``) so it can insert ``cycle_delay_s`` of dwell
+    time there -- a plain flattened repeat has no gap between cycles at all
+    otherwise, since consecutive steps' ``time_s`` values just pick up where
+    the previous cycle left off.
+
+    ``sequence_csv_path``, if given, is the exact CSV *steps* was parsed
+    from; it gets duplicated next to the run's metadata JSON (see the
+    metadata-saving block below) so the metadata alone is enough to recover
+    every parameter of the run without cross-referencing GUI state that may
+    have since changed.
+    """
     if time_mode not in {"step", "absolute"}:
         raise ValueError("time_mode must be one of: step, absolute")
 
@@ -789,6 +913,10 @@ def run_sequence(
         steps = _with_live_first_step_timing(steps, printer)
 
     home_step: SequenceStep | None = steps[0] if steps else None
+    # steps is already the fully flattened loops*cycle list -- see the
+    # loops/cycle_delay_s docstring above -- so the boundary between two
+    # passes through the grid is just an even split by loop count.
+    steps_per_cycle = len(steps) // loops if loops > 0 and len(steps) % max(loops, 1) == 0 else len(steps)
     previous_t = 0.0
     scheduled_elapsed = 0.0
     start_monotonic = time.perf_counter()
@@ -843,6 +971,9 @@ def run_sequence(
     if metadata is not None:
         metadata.started_utc = datetime.now(timezone.utc).isoformat()
         metadata.total_steps = len(steps)
+        metadata.loops = loops
+        metadata.cycle_delay_s = cycle_delay_s
+        metadata.steps_per_cycle = steps_per_cycle
 
     steps_completed = 0
     try:
@@ -856,6 +987,42 @@ def run_sequence(
                 if printer is not None:
                     printer.stop_motion()
                 break
+
+            # --- Delay between cycles (repeats of the full grid) ---
+            # Fires once per loop boundary, right before the new cycle's
+            # first move/V/I is sent -- the gantry and heater just sit at
+            # wherever the previous cycle left them for the extra duration.
+            # Checked before steps_completed is advanced so an abort during
+            # the pause itself doesn't count this step as executed.
+            if (
+                cycle_delay_s > 0
+                and loops > 1
+                and index > 1
+                and steps_per_cycle > 0
+                and (index - 1) % steps_per_cycle == 0
+            ):
+                cycle_num = (index - 1) // steps_per_cycle + 1
+                print(
+                    f"--- Cycle {cycle_num}/{loops}: pausing {cycle_delay_s:.1f}s before "
+                    "starting the next pass ---",
+                    flush=True,
+                )
+                if stop_event is not None:
+                    interrupted = _interruptible_sleep(cycle_delay_s, stop_event)
+                    if interrupted:
+                        print("\nStop requested — aborting sequence.", flush=True)
+                        if printer is not None:
+                            printer.stop_motion()
+                        break
+                else:
+                    time.sleep(cycle_delay_s)
+                # Shift the schedule's origin forward by the same amount so
+                # the upcoming per-step wait_s calculations (based on
+                # start_monotonic + scheduled_elapsed) don't see this pause
+                # as the run having fallen behind and try to "catch up" by
+                # skipping the next few steps' waits.
+                scheduled_elapsed += cycle_delay_s
+
             steps_completed = index
             if not dry_run:
                 assert dps is not None  # narrowed by the entry guard
@@ -959,6 +1126,19 @@ def run_sequence(
                 metadata.steps_completed = steps_completed
                 metadata.completed = (steps_completed == metadata.total_steps)
                 out_dir = record_dir if record_dir is not None else Path(".")
+                if sequence_csv_path is not None and sequence_csv_path.exists():
+                    # Duplicate the exact CSV that was executed next to the
+                    # metadata JSON, so the JSON alone (via csv_copy) is
+                    # enough to recover every per-step parameter of this run
+                    # -- the original file may since be overwritten,
+                    # regenerated with different settings, or moved.
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    csv_copy_path = out_dir / f"sequence_{metadata.run_id}.csv"
+                    try:
+                        shutil.copy2(sequence_csv_path, csv_copy_path)
+                        metadata.csv_copy = str(csv_copy_path)
+                    except OSError as exc:
+                        print(f"WARNING: failed to copy sequence CSV into {out_dir}: {exc}", flush=True)
                 save_run_metadata(metadata, out_dir)
             except Exception as exc:
                 print(f"WARNING: failed to save run metadata: {exc}", flush=True)
@@ -1045,6 +1225,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Repeat the schedule this many times (helper loop generation)",
+    )
+    parser.add_argument(
+        "--cycle-delay",
+        type=float,
+        default=0.0,
+        help="Pause this many seconds between repeats of the schedule when --loops > 1 "
+             "(no-op for --loops 1)",
     )
     parser.add_argument(
         "--time-mode",
@@ -1175,7 +1362,10 @@ def main() -> None:
     looped_steps = expand_loop_steps(steps, args.loops)
 
     if args.dry_run:
-        run_sequence(looped_steps, dps=None, printer=None, time_mode=args.time_mode, dry_run=True)
+        run_sequence(
+            looped_steps, dps=None, printer=None, time_mode=args.time_mode, dry_run=True,
+            loops=args.loops, cycle_delay_s=args.cycle_delay,
+        )
         return
 
     if not args.modbus_port.strip():
@@ -1210,7 +1400,10 @@ def main() -> None:
     metadata = RunMetadata(
         run_id=run_id,
         csv_file=str(args.csv),
+        csv_format="raw",
+        source_csv=str(args.csv),
         loops=args.loops,
+        cycle_delay_s=args.cycle_delay,
         time_mode=args.time_mode,
         default_feedrate=args.default_feedrate,
         dry_run=args.dry_run,
@@ -1244,6 +1437,9 @@ def main() -> None:
         cameras=cameras,
         record_dir=args.record_dir,
         metadata=metadata,
+        loops=args.loops,
+        cycle_delay_s=args.cycle_delay,
+        sequence_csv_path=args.csv,
     )
 
 

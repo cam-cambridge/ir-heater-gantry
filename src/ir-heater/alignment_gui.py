@@ -255,6 +255,7 @@ class AlignmentWindow(QMainWindow):
         self._jog_buttons: list[QPushButton] = []
         self._go_btn: QPushButton | None = None
         self._zero_btn: QPushButton | None = None
+        self._reapply_zero_btn: QPushButton | None = None
 
         self._build_ui()
 
@@ -364,9 +365,23 @@ class AlignmentWindow(QMainWindow):
         )
         zero_btn.clicked.connect(self._zero_here)
         zero_row.addWidget(zero_btn)
+
+        reapply_zero_btn = QPushButton("Reapply Saved Zero")
+        reapply_zero_btn.setToolTip(
+            "Restore the last \"Zero Here\" mark on this fresh connection,\n"
+            "without needing to jog back to it and re-click Zero Here.\n\n"
+            "Only correct if the controller has stayed powered continuously\n"
+            "since that zero was set -- a real power-cycle loses GRBL's\n"
+            "position tracking entirely (no homing hardware to re-anchor it),\n"
+            "which would silently apply the wrong offset. Don't use this\n"
+            "after power was cut; jog to the mark and click Zero Here instead."
+        )
+        reapply_zero_btn.clicked.connect(self._reapply_saved_zero)
+        zero_row.addWidget(reapply_zero_btn)
         zero_row.addStretch()
         pos_layout.addLayout(zero_row)
         self._zero_btn = zero_btn
+        self._reapply_zero_btn = reapply_zero_btn
 
         goto_row = QHBoxLayout()
         goto_row.addWidget(QLabel("Go to X:"))
@@ -581,6 +596,8 @@ class AlignmentWindow(QMainWindow):
             self._go_btn.setEnabled(enabled)
         if self._zero_btn is not None:
             self._zero_btn.setEnabled(enabled)
+        if self._reapply_zero_btn is not None:
+            self._reapply_zero_btn.setEnabled(enabled)
 
     def _jog(self, dx_sign: int, dy_sign: int, dz_sign: int) -> None:
         grbl = self._grbl
@@ -673,6 +690,43 @@ class AlignmentWindow(QMainWindow):
             self._grbl.set_zero()
         except (TimeoutError, OSError) as exc:
             QMessageBox.critical(self, "Zero Error", str(exc))
+        finally:
+            self._hw_busy = False
+            self._set_hw_controls_enabled(True)
+
+    def _reapply_saved_zero(self) -> None:
+        if self._grbl is None:
+            QMessageBox.warning(self, "No GRBL", "GRBL is not connected.")
+            return
+        if self._hw_busy:
+            return
+        if not self._grbl.has_saved_zero():
+            QMessageBox.information(
+                self, "Reapply Saved Zero",
+                "No saved zero found. Use \"Zero Here\" first.",
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Reapply Saved Zero",
+            "Restore the last \"Zero Here\" mark on this connection?\n\n"
+            "Only confirm this if the controller has stayed powered "
+            "continuously since that zero was set. If it was power-cycled "
+            "since then, this will silently apply the wrong offset -- jog "
+            "to the physical mark and use \"Zero Here\" instead.",
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._hw_busy = True
+        self._set_hw_controls_enabled(False)
+        try:
+            if not self._grbl.reapply_saved_zero():
+                QMessageBox.warning(
+                    self, "Reapply Saved Zero",
+                    "Could not read the saved zero (missing or corrupt).",
+                )
+        except (TimeoutError, OSError) as exc:
+            QMessageBox.critical(self, "Reapply Zero Error", str(exc))
         finally:
             self._hw_busy = False
             self._set_hw_controls_enabled(True)
