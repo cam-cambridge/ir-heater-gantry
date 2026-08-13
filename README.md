@@ -287,11 +287,33 @@ pillow>=12.1.1         # Image support
   would make every "Zero Here" invisible to both the position readout and
   `run_sequence`'s motion-drift check. `GrblController` forces `$10=2`
   (report WPos) right after connecting for this reason.
-- Every command sent to GRBL (`_send_line`) has a bounded 10s timeout and
-  raises `TimeoutError` instead of blocking forever if a reply never
-  arrives (e.g. a dropped byte on a flaky link). The `align` GUI's jog/go-to
-  buttons call GRBL directly on the main Qt thread, so an unbounded wait
-  there used to freeze the entire window until the process was killed.
+- Every command sent to GRBL (`_send_line`) has a bounded timeout instead of
+  waiting forever. Motion acknowledgements use a 2s normal deadline and a
+  lost acknowledgement enters bounded recovery: the heater output is
+  suspended, GRBL is queried with real-time `?` status, and an absolute G1
+  is resent only when GRBL proves it is still `Idle` at the known start.
+  If the USB serial device disappeared, the same physical adapter is located
+  by USB serial number/topology and reopened without issuing a GRBL reset.
+  A reset banner, Alarm, implausible coordinate, or unverified partial move
+  aborts the run because this unhomed machine has no way to reconstruct its
+  physical reference safely. Arc moves are not blindly resent: their I/J
+  offsets are relative to the start point, so recovery accepts an arc only
+  when status proves it is already running or at its endpoint.
+- Linear and arc commands carry their feedrate in the same G-code line. This
+  makes each absolute linear move self-contained and safely repeatable after
+  a lost frame instead of depending on a preceding `G1 F...` line.
+- Run metadata includes `grbl_events` (timestamped TX/reply/status/reconnect/
+  recovery records), `grbl_recoveries`, `gantry_position_trusted`,
+  `max_schedule_lateness_s`, and `timing_warnings`. Recovery does not move
+  the schedule origin: later steps retain their original monotonic deadlines,
+  so any resulting catch-up/lateness is explicit in the log. A failed move
+  is no longer counted as a completed step. `cleanup_warnings` records a
+  failed heater shutdown, final move, or serial close separately from the
+  experimental sequence result.
+- On an unrecoverable communication failure the software makes a best-effort
+  real-time feed hold, turns the heater off, and deliberately skips the
+  automatic return-to-origin. Sending an origin move after a possible GRBL
+  reset would be unsafe because the coordinate frame may have been lost.
 - `pattern_generator.generate_heat_sequence` has no live GRBL connection at
   CSV-generation time, so without an explicit `start_position` it guesses a
   fixed 0.5s for the very first move regardless of the real distance. If

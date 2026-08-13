@@ -81,15 +81,24 @@ class RunMetadata:
     steps_completed: int = 0
     error: str = ""
     drift_warnings: list[str] = field(default_factory=list)
+    grbl_events: list[dict[str, object]] = field(default_factory=list)
+    grbl_recoveries: int = 0
+    gantry_position_trusted: bool = True
+    max_schedule_lateness_s: float = 0.0
+    timing_warnings: list[str] = field(default_factory=list)
+    cleanup_warnings: list[str] = field(default_factory=list)
 
 
-def save_run_metadata(meta: RunMetadata, output_dir: Path) -> Path:
+def save_run_metadata(
+    meta: RunMetadata, output_dir: Path, *, announce: bool = True,
+) -> Path:
     """Write *meta* as a JSON file in *output_dir*."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"run_metadata_{meta.run_id}.json"
     data = asdict(meta)
     path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    print(f"Metadata saved -> {path}", flush=True)
+    if announce:
+        print(f"Metadata saved -> {path}", flush=True)
     return path
 
 
@@ -286,13 +295,28 @@ def _parse_position_xyz(status: str) -> tuple[float, float, float] | None:
     """Extract (X, Y, Z) from a GRBL ``?`` status report's MPos/WPos field."""
     for part in status.split("|"):
         if part.startswith("MPos:") or part.startswith("WPos:"):
-            coords = part.split(":", 1)[1].split(",")
+            coords = part.split(":", 1)[1].rstrip(">").split(",")
             if len(coords) >= 3:
                 try:
                     return float(coords[0]), float(coords[1]), float(coords[2])
                 except ValueError:
                     return None
     return None
+
+
+def _parse_grbl_state(status: str) -> str:
+    """Return the state word at the start of a GRBL ``<...>`` report."""
+    if not status.startswith("<"):
+        return ""
+    return status[1:].split("|", 1)[0].split(":", 1)[0]
+
+
+class GrblCommunicationError(RuntimeError):
+    """GRBL communication was lost and could not be recovered safely."""
+
+
+class GrblPositionUncertainError(GrblCommunicationError):
+    """GRBL may have reset, so its coordinate frame can no longer be trusted."""
 
 
 class GrblController:
@@ -345,6 +369,15 @@ class GrblController:
                 )
             serial_port = detected
 
+        self._serial_port = serial_port
+        self._baudrate = baudrate
+        self._port_identity = self._capture_port_identity(serial_port)
+        self._event_sink: Callable[[dict[str, object]], None] | None = None
+        self._recovery_state_sink: Callable[[str], None] | None = None
+        self._last_reported_position: tuple[float, float, float] | None = None
+        self._last_commanded_position: tuple[float, float, float] | None = None
+        self._initialized = False
+        self._command_number = 0
         self._serial = pyserial.Serial(serial_port, baudrate, timeout=1.0)
         # Give any hardware auto-reset (DTR toggle on Arduino-style boards)
         # time to finish booting before we start reading.
@@ -403,6 +436,77 @@ class GrblController:
         # tells GRBL to trust the current step position.
         self._clear_alarm()
         self._ensure_wpos_reporting()
+        self._initialized = True
+
+    @staticmethod
+    def _capture_port_identity(device: str) -> dict[str, object]:
+        """Remember enough USB identity to find the same physical adapter
+        after Linux assigns it a different ``ttyUSB`` number.
+
+        The two CH341 adapters used by this rig do not expose serial numbers,
+        so USB topology (``location``) is the safest discriminator available.
+        We deliberately never fall back to an arbitrary adapter with the same
+        VID/PID, because that could send G-code to the DPS serial interface.
+        """
+        for port in _list_ports.comports():
+            if port.device == device:
+                return {
+                    "device": port.device,
+                    "serial_number": port.serial_number,
+                    "location": port.location,
+                    "vid": port.vid,
+                    "pid": port.pid,
+                }
+        return {"device": device}
+
+    def _resolve_reconnect_port(self) -> str | None:
+        serial_number = self._port_identity.get("serial_number")
+        location = self._port_identity.get("location")
+        for port in _list_ports.comports():
+            if serial_number and port.serial_number == serial_number:
+                return port.device
+            if location and port.location == location:
+                return port.device
+        # Stable aliases such as /dev/serial/by-path/... remain usable even
+        # when the ttyUSB number underneath changes.
+        if Path(self._serial_port).exists():
+            return self._serial_port
+        return None
+
+    def set_event_sink(
+        self, sink: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        """Receive structured command/recovery diagnostics for run metadata."""
+        self._event_sink = sink
+
+    def set_recovery_state_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Receive ``started``/``recovered`` recovery notifications.
+
+        ``run_sequence`` uses this to remove heater power while gantry
+        position is uncertain. A failed recovery intentionally has no
+        ``recovered`` notification, leaving final cleanup to keep it off.
+        """
+        self._recovery_state_sink = sink
+
+    def _log_event(self, event: str, **details: object) -> None:
+        record: dict[str, object] = {
+            "utc": datetime.now(timezone.utc).isoformat(),
+            "monotonic_s": time.perf_counter(),
+            "event": event,
+        }
+        record.update(details)
+        if self._event_sink is not None:
+            self._event_sink(record)
+
+    def _notify_recovery_state(self, state: str) -> None:
+        if self._recovery_state_sink is not None:
+            try:
+                self._recovery_state_sink(state)
+            except Exception as exc:
+                self._log_event(
+                    "recovery_callback_error", state=state, error=str(exc),
+                )
+                raise
 
     def _ensure_wpos_reporting(self) -> None:
         """Force ``$10=2`` so ``?`` status reports show ``WPos`` (work
@@ -460,10 +564,19 @@ class GrblController:
     def _read_status_report(self, timeout_s: float = 1.0) -> str:
         """Poll GRBL's real-time status (``?``) and return the ``<...>`` line."""
         self._serial.write(b"?")
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
             line = self._serial.readline().decode(errors="replace").strip()
+            if self._initialized and "grbl" in line.lower():
+                self._log_event("reset_banner", line=line)
+                raise GrblPositionUncertainError(
+                    "GRBL reset banner received during a run; without homing or "
+                    "encoders its coordinate frame is no longer trustworthy."
+                )
             if line.startswith("<"):
+                pos = _parse_position_xyz(line)
+                if pos is not None:
+                    self._last_reported_position = pos
                 return line
         return ""
 
@@ -482,22 +595,321 @@ class GrblController:
         wedged serial link must never hang the caller -- this used to loop
         forever, which froze the whole GUI when called from a jog button.
         """
+        self._command_number += 1
+        command_number = self._command_number
+        started = time.perf_counter()
+        self._log_event(
+            "command_tx", command_number=command_number, command=line,
+        )
         self._serial.write(line.encode() + b"\n")
         response_parts: list[str] = []
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
             resp = self._serial.readline()
             if not resp:
                 continue  # per-read timeout – keep waiting up to the deadline
             decoded = resp.decode(errors="replace").strip()
+            if self._initialized and "grbl" in decoded.lower():
+                self._log_event(
+                    "reset_banner", command_number=command_number, line=decoded,
+                )
+                raise GrblPositionUncertainError(
+                    "GRBL reset while waiting for a command acknowledgement; "
+                    "position cannot be trusted without homing or encoders."
+                )
             if decoded:
                 response_parts.append(decoded)
             if "ok" in decoded or "error" in decoded:
-                return "\n".join(response_parts)
+                response = "\n".join(response_parts)
+                self._log_event(
+                    "command_reply",
+                    command_number=command_number,
+                    command=line,
+                    elapsed_s=time.perf_counter() - started,
+                    response=response,
+                )
+                return response
+        self._log_event(
+            "command_timeout",
+            command_number=command_number,
+            command=line,
+            timeout_s=timeout_s,
+            received=response_parts,
+        )
         raise TimeoutError(
             f"No response from GRBL to {line!r} within {timeout_s:.1f}s "
             f"(received so far: {response_parts!r})"
         )
+
+    @staticmethod
+    def _position_on_segment(
+        position: tuple[float, float, float],
+        start: tuple[float, float, float],
+        target: tuple[float, float, float],
+        tolerance_mm: float = 1.0,
+    ) -> bool:
+        """Whether *position* plausibly lies on the commanded straight move."""
+        segment = tuple(b - a for a, b in zip(start, target))
+        length_sq = sum(v * v for v in segment)
+        if length_sq <= 1e-12:
+            return math.dist(position, target) <= tolerance_mm
+        relative = tuple(p - a for p, a in zip(position, start))
+        fraction = sum(r * d for r, d in zip(relative, segment)) / length_sq
+        fraction = max(0.0, min(1.0, fraction))
+        closest = tuple(a + fraction * d for a, d in zip(start, segment))
+        return math.dist(position, closest) <= tolerance_mm
+
+    def _classify_recovery_status(
+        self,
+        status: str,
+        start: tuple[float, float, float] | None,
+        target: tuple[float, float, float],
+        tolerance_mm: float = 0.25,
+    ) -> str:
+        """Classify a status report after an acknowledgement was lost.
+
+        Returns ``accepted`` when the original move is demonstrably running
+        or complete, and ``not_accepted`` only when GRBL is idle at the
+        known starting point. Anything else is unsafe to guess about.
+        """
+        state = _parse_grbl_state(status)
+        position = _parse_position_xyz(status)
+        if state == "Alarm":
+            raise GrblPositionUncertainError(
+                f"GRBL entered Alarm during communication recovery: {status}"
+            )
+        if position is None:
+            raise GrblCommunicationError(
+                f"GRBL replied during recovery but reported no usable position: {status!r}"
+            )
+        if math.dist(position, target) <= tolerance_mm:
+            return "accepted"
+        if start is None:
+            raise GrblPositionUncertainError(
+                "GRBL communication recovered, but there is no pre-move position "
+                "available to verify that its coordinate frame was preserved."
+            )
+        if not self._position_on_segment(position, start, target):
+            raise GrblPositionUncertainError(
+                "GRBL communication recovered at an implausible position "
+                f"{position}; expected the move from {start} to {target}."
+            )
+        if state in {"Run", "Jog", "Hold"}:
+            return "accepted"
+        if state == "Idle" and math.dist(position, start) <= tolerance_mm:
+            return "not_accepted"
+        raise GrblPositionUncertainError(
+            "GRBL stopped at an intermediate position after communication was "
+            f"lost ({status}); refusing to guess whether the move is complete."
+        )
+
+    def _probe_status_for_recovery(self, attempts: int = 3) -> str:
+        for attempt in range(1, attempts + 1):
+            try:
+                status = self._read_status_report(timeout_s=0.75)
+            except (OSError, pyserial.SerialException) as exc:
+                self._log_event(
+                    "status_probe_error", attempt=attempt, error=str(exc),
+                )
+                return ""
+            self._log_event(
+                "status_probe", attempt=attempt, status=status,
+            )
+            if status:
+                return status
+        return ""
+
+    def _reopen_without_reset(self, attempts: int = 3) -> str:
+        """Reopen the same physical USB adapter and query status.
+
+        No soft reset, alarm unlock, or modal command is sent here. A reset
+        banner is fatal because this gantry has no homing/encoder reference.
+        """
+        try:
+            self._serial.close()
+        except Exception:
+            pass
+
+        last_error = "device did not reappear"
+        for attempt in range(1, attempts + 1):
+            device = self._resolve_reconnect_port()
+            self._log_event(
+                "reconnect_attempt", attempt=attempt, device=device or "",
+            )
+            if device is None:
+                time.sleep(0.25)
+                continue
+            candidate = None
+            try:
+                candidate = pyserial.Serial(device, self._baudrate, timeout=0.2)
+                self._serial = candidate
+
+                # Observe startup output before sending anything. Reopening
+                # some boards toggles DTR and resets the MCU; proceeding in
+                # that case would silently use a new, unreferenced origin.
+                startup_lines: list[str] = []
+                startup_deadline = time.perf_counter() + 0.75
+                while time.perf_counter() < startup_deadline:
+                    raw = candidate.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode(errors="replace").strip()
+                    if line:
+                        startup_lines.append(line)
+                    if "grbl" in line.lower():
+                        self._log_event(
+                            "reconnect_reset_detected", device=device, line=line,
+                        )
+                        raise GrblPositionUncertainError(
+                            "GRBL reset while its USB connection was reopened; "
+                            "position cannot be trusted without homing or encoders."
+                        )
+
+                status = self._read_status_report(timeout_s=1.0)
+                if status:
+                    self._log_event(
+                        "reconnect_success",
+                        attempt=attempt,
+                        device=device,
+                        startup_lines=startup_lines,
+                        status=status,
+                    )
+                    return status
+                last_error = "device reopened but did not answer a status query"
+            except GrblPositionUncertainError:
+                if candidate is not None:
+                    candidate.close()
+                raise
+            except (OSError, pyserial.SerialException) as exc:
+                last_error = str(exc)
+                self._log_event(
+                    "reconnect_error", attempt=attempt, device=device, error=last_error,
+                )
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+            time.sleep(0.25)
+        raise GrblCommunicationError(
+            f"Could not restore the GRBL serial connection after {attempts} attempts: "
+            f"{last_error}"
+        )
+
+    def _recover_motion_command(
+        self,
+        line: str,
+        start: tuple[float, float, float] | None,
+        target: tuple[float, float, float],
+        retry_safe: bool,
+        original_error: Exception,
+    ) -> str:
+        """Recover a motion whose acknowledgement was lost.
+
+        Absolute linear moves are safe to resend when status proves GRBL is
+        idle at the known start. Arc I/J offsets are start-relative, so arcs
+        are never resent after an uncertain partial execution.
+        """
+        self._log_event(
+            "recovery_started",
+            command=line,
+            start=list(start) if start is not None else None,
+            target=list(target),
+            retry_safe=retry_safe,
+            error=str(original_error),
+        )
+        try:
+            self._notify_recovery_state("started")
+        except Exception as exc:
+            raise GrblCommunicationError(
+                "A GRBL acknowledgement was lost and the heater could not be "
+                f"suspended before recovery: {exc}"
+            ) from exc
+
+        status = self._probe_status_for_recovery()
+        if not status:
+            status = self._reopen_without_reset()
+
+        decision = self._classify_recovery_status(status, start, target)
+        if decision == "accepted":
+            self._log_event(
+                "recovery_confirmed", command=line, action="status_confirmed", status=status,
+            )
+            self._notify_recovery_state("recovered")
+            return "recovered: status confirmed command accepted"
+
+        if not retry_safe:
+            raise GrblCommunicationError(
+                "GRBL is responsive and still at the known start position, but the "
+                "lost command was an arc and cannot be resent safely because I/J "
+                "offsets are relative to the arc start."
+            )
+
+        # GRBL is responsive, Idle, and still at the known start: the command
+        # was not accepted. Resend the absolute, self-contained linear move.
+        for retry in range(1, 3):
+            self._log_event(
+                "recovery_resend", command=line, retry=retry, status=status,
+            )
+            try:
+                response = self._send_line(line, timeout_s=2.0)
+            except (TimeoutError, OSError, pyserial.SerialException) as exc:
+                self._log_event(
+                    "recovery_resend_failed", command=line, retry=retry, error=str(exc),
+                )
+                status = self._probe_status_for_recovery()
+                if not status:
+                    status = self._reopen_without_reset()
+                decision = self._classify_recovery_status(status, start, target)
+                if decision == "accepted":
+                    self._log_event(
+                        "recovery_confirmed",
+                        command=line,
+                        action="retry_status_confirmed",
+                        retry=retry,
+                        status=status,
+                    )
+                    self._notify_recovery_state("recovered")
+                    return "recovered: retry accepted"
+                continue
+            if "error" in response.lower():
+                self._log_event(
+                    "recovery_resend_rejected", command=line, retry=retry, response=response,
+                )
+                continue
+            self._log_event(
+                "recovery_confirmed",
+                command=line,
+                action="resent",
+                retry=retry,
+                response=response,
+            )
+            self._notify_recovery_state("recovered")
+            return response
+
+        raise GrblCommunicationError(
+            f"GRBL communication returned, but {line!r} could not be confirmed "
+            "after two safe retries."
+        )
+
+    def _send_motion_line(
+        self,
+        line: str,
+        target: tuple[float, float, float],
+        *,
+        retry_safe: bool,
+    ) -> str:
+        start = self._last_commanded_position or self._last_reported_position
+        try:
+            response = self._send_line(line, timeout_s=2.0)
+        except (TimeoutError, OSError, pyserial.SerialException) as exc:
+            response = self._recover_motion_command(
+                line, start, target, retry_safe=retry_safe, original_error=exc,
+            )
+        if "error" in response.lower():
+            raise GrblCommunicationError(f"GRBL rejected {line!r}: {response}")
+        self._last_commanded_position = target
+        return response
 
     # ------------------------------------------------------------------
     #  Public API  (compatible with the old PrinterController)
@@ -519,14 +931,11 @@ class GrblController:
             )
         x, y, z = clamped_x, clamped_y, clamped_z
 
-        if self._last_feedrate != feedrate:
-            resp1 = self._send_line(f"G1 F{feedrate:.2f}")
-            if "error" in resp1:
-                print(f"GRBL error setting feedrate: {resp1}", flush=True)
-            self._last_feedrate = feedrate
-        resp2 = self._send_line(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f}")
-        if "error" in resp2:
-            print(f"GRBL error on move: {resp2}", flush=True)
+        # Keep every move self-contained. If a USB frame is dropped, a retry
+        # must not depend on a separate feedrate command having arrived.
+        line = f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feedrate:.2f}"
+        self._send_motion_line(line, (x, y, z), retry_safe=True)
+        self._last_feedrate = feedrate
 
     def send_arc(
         self,
@@ -569,17 +978,13 @@ class GrblController:
                     "refusing to send (clamping would corrupt the arc geometry)."
                 )
 
-        if self._last_feedrate != feedrate:
-            self._last_feedrate = feedrate
-            feed_word = f" F{feedrate:.2f}"
-        else:
-            feed_word = ""
         cmd = "G2" if cw else "G3"
-        resp = self._send_line(
-            f"{cmd} X{x:.3f} Y{y:.3f} Z{z:.3f} I{i:.3f} J{j:.3f}{feed_word}"
+        self._send_motion_line(
+            f"{cmd} X{x:.3f} Y{y:.3f} Z{z:.3f} I{i:.3f} J{j:.3f} F{feedrate:.2f}",
+            (x, y, z),
+            retry_safe=False,
         )
-        if "error" in resp:
-            print(f"GRBL error on arc move: {resp}", flush=True)
+        self._last_feedrate = feedrate
 
     def set_zero(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
         """Redefine the current physical position as (*x*, *y*, *z*) via ``G92``.
@@ -605,6 +1010,11 @@ class GrblController:
         if "error" in resp:
             print(f"GRBL error setting zero: {resp}", flush=True)
             return
+        # G92 changed the active coordinate frame without motion. Recovery
+        # validation must use the new work coordinates, not the last target
+        # from the old frame.
+        self._last_reported_position = (x, y, z)
+        self._last_commanded_position = (x, y, z)
         if pos_before is not None:
             # raw = the absolute/uncalibrated position GRBL would call MPos,
             # recovered from the just-reported WPos plus whatever offset was
@@ -669,7 +1079,14 @@ class GrblController:
 
     def get_status(self) -> str:
         """Return GRBL's real-time status report (``?`` command)."""
-        return self._read_status_report(timeout_s=0.5)
+        try:
+            status = self._read_status_report(timeout_s=0.5)
+        except (OSError, pyserial.SerialException) as exc:
+            self._log_event("status_query_error", error=str(exc))
+            return ""
+        if not status:
+            self._log_event("status_query_timeout")
+        return status
 
     def soft_reset(self) -> None:
         """Send Ctrl-X (0x18) to soft-reset GRBL."""
@@ -755,7 +1172,7 @@ def _parse_mpos(status: str) -> tuple[float, float] | None:
     """Extract (X, Y) from a GRBL ``?`` status report's MPos/WPos field."""
     for part in status.split("|"):
         if part.startswith("MPos:") or part.startswith("WPos:"):
-            coords = part.split(":", 1)[1].split(",")
+            coords = part.split(":", 1)[1].rstrip(">").split(",")
             if len(coords) >= 2:
                 try:
                     return float(coords[0]), float(coords[1])
@@ -909,6 +1326,34 @@ def run_sequence(
     if not dry_run and dps is None:
         raise ValueError("dps instance is required when dry_run is False")
 
+    recovery_context = {"heater_active": False, "restore_pending": False}
+    if printer is not None:
+        def _record_grbl_event(event: dict[str, object]) -> None:
+            if metadata is not None:
+                metadata.grbl_events.append(event)
+                if event.get("event") == "recovery_started":
+                    metadata.grbl_recoveries += 1
+
+        def _handle_recovery_state(state: str) -> None:
+            # A lost acknowledgement makes gantry position temporarily
+            # uncertain. Remove heat during diagnosis/reconnect, then restore
+            # it only if recovery succeeds while the sequence is still live.
+            if dry_run or dps is None:
+                return
+            if state == "started" and recovery_context["heater_active"]:
+                dps.onoff("w", 0)
+                recovery_context["heater_active"] = False
+                recovery_context["restore_pending"] = True
+                printer._log_event("heater_suspended_for_recovery")
+            elif state == "recovered" and recovery_context["restore_pending"]:
+                dps.onoff("w", 1)
+                recovery_context["heater_active"] = True
+                recovery_context["restore_pending"] = False
+                printer._log_event("heater_restored_after_recovery")
+
+        printer.set_event_sink(_record_grbl_event)
+        printer.set_recovery_state_sink(_handle_recovery_state)
+
     if printer is not None and not dry_run:
         steps = _with_live_first_step_timing(steps, printer)
 
@@ -919,13 +1364,9 @@ def run_sequence(
     steps_per_cycle = len(steps) // loops if loops > 0 and len(steps) % max(loops, 1) == 0 else len(steps)
     previous_t = 0.0
     scheduled_elapsed = 0.0
-    start_monotonic = time.perf_counter()
     last_voltage: float | None = None
     last_current: float | None = None
     prev_x, prev_y, prev_z = 0.0, 0.0, 0.0
-
-    # --- Periodic motion-drift verification state (see _check_motion_drift) ---
-    drift_check_t = start_monotonic
 
     # --- Camera recording / live preview (separate process — never blocks
     # timing loop, and preview runs at its own rate independent of the
@@ -975,11 +1416,18 @@ def run_sequence(
         metadata.cycle_delay_s = cycle_delay_s
         metadata.steps_per_cycle = steps_per_cycle
 
+    # The experimental timeline starts only after cameras are open and their
+    # writers have acknowledged startup. Including setup latency here used to
+    # make the first sequence steps "late" before motion had even begun.
+    start_monotonic = time.perf_counter()
+    drift_check_t = start_monotonic
     steps_completed = 0
+    gantry_position_trusted = True
     try:
         if not dry_run:
             assert dps is not None  # narrowed by the entry guard
             dps.onoff("w", 1)
+            recovery_context["heater_active"] = True
 
         for index, step in enumerate(steps, start=1):
             if stop_event is not None and stop_event.is_set():
@@ -1023,7 +1471,6 @@ def run_sequence(
                 # skipping the next few steps' waits.
                 scheduled_elapsed += cycle_delay_s
 
-            steps_completed = index
             if not dry_run:
                 assert dps is not None  # narrowed by the entry guard
                 if last_voltage != step.voltage_v:
@@ -1043,6 +1490,9 @@ def run_sequence(
                 else:
                     printer.send_move(step.x, step.y, step.z, step.feedrate)
 
+            # Count a step only after its motion command was acknowledged or
+            # safely recovered. Previously a failed attempt was counted too.
+            steps_completed = index
             prev_x, prev_y, prev_z = step.x, step.y, step.z
 
             print(
@@ -1079,6 +1529,18 @@ def run_sequence(
                         break
                 else:
                     time.sleep(wait_s)
+            elif metadata is not None:
+                lateness_s = -wait_s
+                metadata.max_schedule_lateness_s = max(
+                    metadata.max_schedule_lateness_s, lateness_s,
+                )
+                if lateness_s >= 0.25:
+                    warning = (
+                        f"Step {index} was {lateness_s:.3f}s behind the original "
+                        "wall-clock schedule; no schedule time was shifted."
+                    )
+                    metadata.timing_warnings.append(warning)
+                    print(f"WARNING: {warning}", flush=True)
 
             # --- Periodic (not per-step) real-position drift check ---
             if printer is not None and not dry_run:
@@ -1090,8 +1552,30 @@ def run_sequence(
     except Exception as exc:
         if metadata is not None:
             metadata.error = str(exc)
+        if isinstance(exc, GrblCommunicationError):
+            gantry_position_trusted = False
+            if metadata is not None:
+                metadata.gantry_position_trusted = False
+            # Best-effort feed hold only. Do not soft-reset here: on this
+            # unhomed machine a reset destroys the coordinate reference.
+            if printer is not None:
+                try:
+                    printer.feed_hold()
+                    stopped = printer.wait_for_hold(timeout_s=3.0)
+                    printer._log_event("failure_feed_hold", confirmed=stopped)
+                except Exception as hold_exc:
+                    printer._log_event(
+                        "failure_feed_hold_error", error=str(hold_exc),
+                    )
         raise
     finally:
+        # From here onward, recovery must never re-enable the heater (for
+        # example if the optional return-to-origin command itself has a USB
+        # hiccup after the heater-off cleanup below).
+        recovery_context["heater_active"] = False
+        recovery_context["restore_pending"] = False
+        if printer is not None:
+            printer.set_recovery_state_sink(None)
         # --- Stop camera process ---
         # Wrapped end-to-end: a failure anywhere in here (e.g. the recorder
         # process already died and the queue is broken) must not skip the
@@ -1124,7 +1608,9 @@ def run_sequence(
                 metadata.completed_utc = datetime.now(timezone.utc).isoformat()
                 metadata.duration_s = time.perf_counter() - start_monotonic
                 metadata.steps_completed = steps_completed
-                metadata.completed = (steps_completed == metadata.total_steps)
+                metadata.completed = (
+                    steps_completed == metadata.total_steps and not metadata.error
+                )
                 out_dir = record_dir if record_dir is not None else Path(".")
                 if sequence_csv_path is not None and sequence_csv_path.exists():
                     # Duplicate the exact CSV that was executed next to the
@@ -1151,18 +1637,20 @@ def run_sequence(
                 dps.onoff("w", 0)
                 print("Light turned off.", flush=True)
             except Exception as exc:
-                print(
-                    f"WARNING: failed to confirm the heater turned off: {exc}. "
-                    "Check the DPS5005 manually.",
-                    flush=True,
+                warning = (
+                    f"Failed to confirm the heater turned off: {exc}. "
+                    "Check the DPS5005 manually."
                 )
+                print(f"WARNING: {warning}", flush=True)
+                if metadata is not None:
+                    metadata.cleanup_warnings.append(warning)
 
         # --- Return to a known position and release the serial port ---
         if printer is not None:
             try:
                 final_xyz: tuple[float, float, float] | None = None
                 final_feedrate = 1200.0
-                if return_to_origin:
+                if return_to_origin and gantry_position_trusted:
                     print(
                         "Moving to origin: X=0.000 Y=0.000 Z=0.000",
                         flush=True,
@@ -1170,7 +1658,7 @@ def run_sequence(
                     final_xyz = (0.0, 0.0, 0.0)
                     final_feedrate = home_step.feedrate if home_step is not None else 1200.0
                     printer.send_move(*final_xyz, final_feedrate)
-                elif home_step is not None:
+                elif home_step is not None and gantry_position_trusted:
                     final_xyz = (home_step.x, home_step.y, home_step.z)
                     final_feedrate = home_step.feedrate
                     print(
@@ -1179,6 +1667,13 @@ def run_sequence(
                         flush=True,
                     )
                     printer.send_move(*final_xyz, final_feedrate)
+                elif not gantry_position_trusted:
+                    print(
+                        "WARNING: not returning the gantry automatically because "
+                        "its coordinate position could not be verified after the "
+                        "communication failure. Re-establish the physical zero first.",
+                        flush=True,
+                    )
 
                 if final_xyz is not None:
                     # send_move only confirms GRBL *accepted* the line into
@@ -1204,11 +1699,34 @@ def run_sequence(
                             flush=True,
                         )
             except Exception as exc:
-                print(f"WARNING: failed to return gantry to a safe position: {exc}", flush=True)
+                warning = f"Failed to return gantry to a safe position: {exc}"
+                print(f"WARNING: {warning}", flush=True)
+                if metadata is not None:
+                    metadata.cleanup_warnings.append(warning)
+                    if isinstance(exc, GrblCommunicationError):
+                        metadata.gantry_position_trusted = False
             finally:
                 # Always release the port, even if the homing move above
                 # timed out -- otherwise it's left open/orphaned.
-                printer.disconnect()
+                try:
+                    printer.disconnect()
+                except Exception as exc:
+                    warning = f"Failed to close the GRBL serial port: {exc}"
+                    print(f"WARNING: {warning}", flush=True)
+                    if metadata is not None:
+                        metadata.cleanup_warnings.append(warning)
+
+        # Final checkpoint captures any GRBL recovery/cleanup events emitted
+        # after the first metadata save above (notably return-to-origin).
+        if metadata is not None:
+            try:
+                save_run_metadata(
+                    metadata,
+                    record_dir if record_dir is not None else Path("."),
+                    announce=False,
+                )
+            except Exception as exc:
+                print(f"WARNING: failed to update final run metadata: {exc}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
